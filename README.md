@@ -51,8 +51,8 @@ pkg-config --modversion opencv4
 ### 2.2 下載與驗證模型
 
 ```bash
-git clone https://github.com/noName-ll/mobile-object-tracker.git
-cd mobile-object-tracker
+git clone https://github.com/noName-ll/object-tracking.git
+cd object-tracking
 bash scripts/download_models.sh
 ```
 
