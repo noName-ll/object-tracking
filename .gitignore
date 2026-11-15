@@ -13,3 +13,9 @@ __pycache__/
 *.pt
 *.pth
 weights/
+/target/
+/build/
+/install/
+/log/
+models/*.onnx
+models/*.part
