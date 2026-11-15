@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.jsonl
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.pt
+*.pth
+weights/
