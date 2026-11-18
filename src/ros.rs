@@ -116,6 +116,7 @@ fn invalidate(last: &mut Observation, status: &str) {
     last.status = status.into();
     last.bbox = None;
     last.model_score = 0.0;
+    last.search_score = 0.0;
     last.inliers = 0;
     last.inlier_ratio = 0.0;
     last.processing_ms = 0.0;
@@ -165,6 +166,7 @@ pub fn run(
         image_width: 0,
         image_height: 0,
         model_score: 0.0,
+        search_score: 0.0,
         inliers: 0,
         inlier_ratio: 0.0,
         blur_variance: 0.0,

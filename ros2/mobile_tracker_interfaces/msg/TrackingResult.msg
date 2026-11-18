@@ -16,7 +16,9 @@ uint32 image_width
 uint32 image_height
 # Raw NanoTrack foreground softmax; not a calibrated identity probability.
 float32 model_score
-# Nonzero only when this observation includes successful SIFT geometry.
+# YOLOE visual-prompt probability on global-search frames; not identity confidence.
+float32 search_score
+# Legacy fields retained for compatibility; always zero with YOLOE.
 uint32 inliers
 float32 inlier_ratio
 float64 blur_variance

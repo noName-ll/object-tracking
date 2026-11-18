@@ -1,0 +1,5 @@
+# One-time export tooling only; runtime remains Rust.
+ultralytics==8.3.203
+onnx==1.19.1
+onnxruntime==1.23.2
+# Install a CPU/GPU-compatible torch + torchvision pair first (see README).

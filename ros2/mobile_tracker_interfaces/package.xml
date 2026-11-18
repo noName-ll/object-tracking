@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>mobile_tracker_interfaces</name>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
   <description>Bounding box and tracking validity for a single retained reference target.</description>
   <maintainer email="310657206+noName-ll@users.noreply.github.com">noName-ll</maintainer>
   <license>Apache-2.0</license>

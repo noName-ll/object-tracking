@@ -25,7 +25,7 @@ fn main() -> Result<()> {
         bail!("ROS support requires cargo build --release --features ros2");
     }
     let mut engine = Engine::new(config, &args.backbone, &args.head)
-        .context("load NanoTrack v2 models; run scripts/download_models.sh first")?;
+        .context("load NanoTrack / YOLOE models; see README model export and ONNX Runtime setup")?;
     if let Some(path) = &args.target {
         engine.set_target(&read_image(path)?, args.roi())?;
         eprintln!("initial reference accepted (generation 1)");

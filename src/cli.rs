@@ -13,7 +13,7 @@ pub enum Durability {
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Rust NanoTrack + geometric reacquisition, with optional ROS 2 transport"
+    about = "Rust NanoTrack + YOLOE visual-prompt global search, with optional ROS 2 transport"
 )]
 #[command(group(ArgGroup::new("source").required(true).args(["video","image_topic"])))]
 #[command(group(ArgGroup::new("reference").required(true).multiple(true).args(["target","target_topic"])))]
@@ -61,10 +61,22 @@ pub struct Args {
     pub head: String,
     #[arg(long, default_value_t = 960)]
     pub max_width: i32,
-    #[arg(long, default_value_t = 12)]
-    pub min_inliers: usize,
-    #[arg(long, default_value_t = 0.4)]
-    pub min_ratio: f32,
+    #[arg(long, default_value = "models/yoloe/encoder.onnx")]
+    pub yoloe_encoder: String,
+    #[arg(long, default_value = "models/yoloe/detector.onnx")]
+    pub yoloe_detector: String,
+    #[arg(long, default_value_t = 640)]
+    pub yoloe_size: usize,
+    #[arg(long, default_value_t = 0.25)]
+    pub search_score: f32,
+    #[arg(long, default_value_t = 0.5)]
+    pub search_iou: f32,
+    #[arg(
+        long,
+        default_value_t = 0.05,
+        help = "Reject similar-score candidates at distinct locations"
+    )]
+    pub search_margin: f32,
     #[arg(long, default_value_t = 0.75)]
     pub model_score: f32,
     #[arg(long, default_value_t = 25.0)]
@@ -104,13 +116,17 @@ impl Args {
             .map(|v| Rect::new(v[0], v[1], v[2], v[3]))
     }
     pub fn config(&self) -> Result<Config> {
+        ensure!(self.max_width >= 64, "max-width must be >=64");
         ensure!(
-            self.max_width >= 64 && self.min_inliers >= 8 && self.verify_every > 0,
-            "invalid dimensions or feature thresholds"
+            self.yoloe_size >= 64 && self.yoloe_size <= 2048 && self.yoloe_size.is_multiple_of(32),
+            "invalid YOLOE input size"
         );
+        ensure!(self.verify_every > 0, "verify-every must be positive");
         ensure!(
-            self.min_ratio.is_finite() && self.min_ratio > 0.0 && self.min_ratio <= 1.0,
-            "min-ratio must be in (0,1]"
+            [self.search_score, self.search_iou, self.search_margin]
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+            "invalid YOLOE thresholds"
         );
         ensure!(
             self.model_score.is_finite() && (0.0..=1.0).contains(&self.model_score),
@@ -126,8 +142,12 @@ impl Args {
         );
         Ok(Config {
             max_width: self.max_width,
-            min_inliers: self.min_inliers,
-            min_ratio: self.min_ratio,
+            yoloe_encoder: self.yoloe_encoder.clone(),
+            yoloe_detector: self.yoloe_detector.clone(),
+            yoloe_size: self.yoloe_size,
+            search_score: self.search_score,
+            search_iou: self.search_iou,
+            search_margin: self.search_margin,
             model_score: self.model_score,
             blur_threshold: self.blur_threshold,
             verify_every: self.verify_every,

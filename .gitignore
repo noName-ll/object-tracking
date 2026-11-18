@@ -19,3 +19,5 @@ weights/
 /log/
 models/*.onnx
 models/*.part
+models/yoloe/
+.export-venv/

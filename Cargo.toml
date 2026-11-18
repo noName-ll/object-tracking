@@ -1,13 +1,13 @@
 [package]
 name = "mobile-object-tracker"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.89"
-description = "Rust NanoTrack + SIFT reacquisition tracker with ROS 2 inputs and bounding-box output"
+description = "Rust NanoTrack + visual-prompt YOLOE global search with ROS 2 bounding boxes"
 
 [features]
 default = ["vision"]
-vision = ["dep:opencv"]
+vision = ["dep:opencv", "dep:ort"]
 ros2 = ["vision", "dep:r2r", "dep:futures"]
 # Type-check ROS adapters without a ROS installation; never use for a runnable binary.
 ros2-doc = ["ros2", "r2r/doc-only"]
@@ -18,7 +18,8 @@ clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-opencv = { version = "0.94", optional = true, default-features = false, features = ["clang-runtime", "calib3d", "features2d", "imgcodecs", "imgproc", "videoio", "dnn"] }
+opencv = { version = "0.94", optional = true, default-features = false, features = ["clang-runtime", "imgcodecs", "imgproc", "videoio", "dnn"] }
+ort = { version = "=2.0.0-rc.10", optional = true, default-features = false, features = ["std", "load-dynamic"] }
 r2r = { version = "0.9.5", optional = true }
 futures = { version = "0.3", optional = true }
 

@@ -1,12 +1,12 @@
 use crate::{
     contract::{Bbox, Header, Observation, TargetSlot},
     nano::NanoTrack,
+    yoloe::{SearchResult, YoloE},
 };
 use anyhow::{ensure, Result};
 use opencv::{
-    calib3d,
-    core::{self, DMatch, KeyPoint, Mat, Point2f, Rect, Scalar, Size, Vector},
-    features2d, imgcodecs, imgproc,
+    core::{self, Mat, Rect, Scalar, Size},
+    imgcodecs, imgproc,
     prelude::*,
 };
 use std::time::{Duration, Instant};
@@ -14,8 +14,12 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub max_width: i32,
-    pub min_inliers: usize,
-    pub min_ratio: f32,
+    pub yoloe_encoder: String,
+    pub yoloe_detector: String,
+    pub yoloe_size: usize,
+    pub search_score: f32,
+    pub search_iou: f32,
+    pub search_margin: f32,
     pub model_score: f32,
     pub blur_threshold: f64,
     pub verify_every: u64,
@@ -27,8 +31,12 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             max_width: 960,
-            min_inliers: 12,
-            min_ratio: 0.4,
+            yoloe_encoder: "models/yoloe/encoder.onnx".into(),
+            yoloe_detector: "models/yoloe/detector.onnx".into(),
+            yoloe_size: 640,
+            search_score: 0.25,
+            search_iou: 0.5,
+            search_margin: 0.05,
             model_score: 0.75,
             blur_threshold: 25.0,
             verify_every: 15,
@@ -38,16 +46,10 @@ impl Default for Config {
     }
 }
 
-pub struct Reference {
-    keypoints: Vector<KeyPoint>,
-    descriptors: Mat,
-    width: i32,
-    height: i32,
-}
-
 pub struct Engine {
     config: Config,
-    reference: TargetSlot<Reference>,
+    reference: TargetSlot<Vec<f32>>,
+    search: YoloE,
     nano: NanoTrack,
     active: bool,
     frame: u64,
@@ -87,20 +89,6 @@ fn gray(image: &Mat) -> Result<Mat> {
     Ok(output)
 }
 
-fn features(image: &Mat) -> Result<(Vector<KeyPoint>, Mat)> {
-    let mut sift = features2d::SIFT::create_def()?;
-    let mut points = Vector::new();
-    let mut descriptors = Mat::default();
-    sift.detect_and_compute(
-        &gray(image)?,
-        &core::no_array(),
-        &mut points,
-        &mut descriptors,
-        false,
-    )?;
-    Ok((points, descriptors))
-}
-
 pub fn blur_variance(image: &Mat) -> Result<f64> {
     let mut lap = Mat::default();
     imgproc::laplacian(
@@ -120,8 +108,17 @@ pub fn blur_variance(image: &Mat) -> Result<f64> {
 
 impl Engine {
     pub fn new(config: Config, backbone: &str, head: &str) -> Result<Self> {
+        let search = YoloE::load(
+            &config.yoloe_encoder,
+            &config.yoloe_detector,
+            config.yoloe_size,
+            config.search_score,
+            config.search_iou,
+            config.search_margin,
+        )?;
         Ok(Self {
             config,
+            search,
             reference: TargetSlot {
                 value: None,
                 generation: 0,
@@ -159,16 +156,8 @@ impl Engine {
             selected.cols() >= 16 && selected.rows() >= 16,
             "reference too small"
         );
-        let selected = resize(&selected, self.config.max_width.min(640))?;
-        let (keypoints, descriptors) = features(&selected)?;
-        ensure!(keypoints.len()>=self.config.min_inliers && !descriptors.empty(),
-            "reference has too few SIFT features for global acquisition; choose a textured view or a tighter ROI");
-        let candidate = Reference {
-            keypoints,
-            descriptors,
-            width: selected.cols(),
-            height: selected.rows(),
-        };
+        // Compute the candidate prompt before changing the retained target or NanoTrack state.
+        let candidate = self.search.encode(&selected)?;
         let generation = self
             .reference
             .replace(Ok::<_, String>(candidate))
@@ -227,6 +216,7 @@ impl Engine {
             image_width: image.cols() as u32,
             image_height: image.rows() as u32,
             model_score: 0.0,
+            search_score: 0.0,
             inliers: 0,
             inlier_ratio: 0.0,
             blur_variance: blur,
@@ -253,11 +243,16 @@ impl Engine {
                 || self
                     .verified_at
                     .is_none_or(|t| t.elapsed() > self.config.verification_ttl);
-            let geometry = if verify { self.locate(&work)? } else { None };
+            let global = if verify {
+                self.search
+                    .search(&work, self.reference.value.as_ref().unwrap())?
+            } else {
+                SearchResult::Missing
+            };
             let mut accepted = None;
-            if let Some((bbox, inliers, ratio)) = geometry {
-                result.inliers = inliers as u32;
-                result.inlier_ratio = ratio;
+            if let SearchResult::Found(candidate) = global {
+                let bbox = candidate.bbox;
+                result.search_score = candidate.score;
                 if learned.is_some_and(|(b, _)| b.iou(bbox) < 0.1) {
                     // Disagreement may mean identity switch: do not silently jump.
                     self.reset_motion();
@@ -270,6 +265,9 @@ impl Engine {
                     result.status = "tracking_verified".into();
                     result.model_score = learned.map_or(0.0, |(_, score)| score);
                 }
+            } else if matches!(global, SearchResult::Ambiguous) {
+                self.reset_motion();
+                result.status = "ambiguous".into();
             } else if let Some((bbox, score)) = learned {
                 if self
                     .verified_at
@@ -297,110 +295,5 @@ impl Engine {
         }
         result.processing_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(result)
-    }
-
-    fn locate(&self, frame: &Mat) -> Result<Option<(Bbox, usize, f32)>> {
-        let Some(reference) = self.reference.value.as_ref() else {
-            return Ok(None);
-        };
-        let (points, desc) = features(frame)?;
-        if desc.rows() < 2 {
-            return Ok(None);
-        }
-        let matcher = features2d::BFMatcher::create(core::NORM_L2, false)?;
-        let mut forward = Vector::<Vector<DMatch>>::new();
-        let mut reverse = Vector::<DMatch>::new();
-        matcher.knn_train_match_def(&reference.descriptors, &desc, &mut forward, 2)?;
-        matcher.train_match_def(&desc, &reference.descriptors, &mut reverse)?;
-        let mut src = Vector::<Point2f>::new();
-        let mut dst = Vector::<Point2f>::new();
-        for pair in forward {
-            if pair.len() < 2 {
-                continue;
-            }
-            let m = pair.get(0)?;
-            let n = pair.get(1)?;
-            if m.distance < 0.75 * n.distance
-                && reverse.get(m.train_idx as usize)?.train_idx == m.query_idx
-            {
-                src.push(reference.keypoints.get(m.query_idx as usize)?.pt());
-                dst.push(points.get(m.train_idx as usize)?.pt());
-            }
-        }
-        if src.len() < self.config.min_inliers {
-            return Ok(None);
-        }
-        let mut mask = Mat::default();
-        let h = calib3d::find_homography_ext(
-            &src,
-            &dst,
-            calib3d::USAC_MAGSAC,
-            4.0,
-            &mut mask,
-            5000,
-            0.999,
-        )?;
-        if h.empty() {
-            return Ok(None);
-        }
-        let flags = mask.data_typed::<u8>()?;
-        let count = flags.iter().filter(|v| **v != 0).count();
-        let ratio = count as f32 / src.len() as f32;
-        if count < self.config.min_inliers || ratio < self.config.min_ratio {
-            return Ok(None);
-        }
-        let inside = Vector::<Point2f>::from_iter(
-            src.iter()
-                .zip(flags)
-                .filter_map(|(p, v)| (*v != 0).then_some(p)),
-        );
-        let mut hull = Vector::<Point2f>::new();
-        imgproc::convex_hull(&inside, &mut hull, false, true)?;
-        let coverage =
-            imgproc::contour_area(&hull, false)? / (reference.width * reference.height) as f64;
-        if coverage < 0.035 {
-            return Ok(None);
-        }
-        let corners = Vector::<Point2f>::from_iter([
-            Point2f::new(0.0, 0.0),
-            Point2f::new((reference.width - 1) as f32, 0.0),
-            Point2f::new((reference.width - 1) as f32, (reference.height - 1) as f32),
-            Point2f::new(0.0, (reference.height - 1) as f32),
-        ]);
-        let mut quad = Vector::<Point2f>::new();
-        core::perspective_transform(&corners, &mut quad, &h)?;
-        if !quad.iter().all(|p| p.x.is_finite() && p.y.is_finite())
-            || !imgproc::is_contour_convex(&quad)?
-        {
-            return Ok(None);
-        }
-        let area = imgproc::contour_area(&quad, false)?.abs();
-        if area < 100.0 || area > (frame.cols() * frame.rows()) as f64 * 1.5 {
-            return Ok(None);
-        }
-        let screen = Vector::<Point2f>::from_iter([
-            Point2f::new(0.0, 0.0),
-            Point2f::new(frame.cols() as f32, 0.0),
-            Point2f::new(frame.cols() as f32, frame.rows() as f32),
-            Point2f::new(0.0, frame.rows() as f32),
-        ]);
-        let mut intersection = Vector::<Point2f>::new();
-        let visible = imgproc::intersect_convex_convex(&quad, &screen, &mut intersection, true)?;
-        if visible as f64 / area < 0.35 {
-            return Ok(None);
-        }
-        let min_x = quad.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
-        let min_y = quad.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
-        let max_x = quad.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
-        let max_y = quad.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
-        let bbox = Bbox {
-            x: min_x,
-            y: min_y,
-            width: max_x - min_x,
-            height: max_y - min_y,
-        };
-        Ok(bbox
-            .clip(frame.cols(), frame.rows())
-            .map(|b| (b, count, ratio)))
     }
 }

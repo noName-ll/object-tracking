@@ -1,116 +1,148 @@
-# Mobile Object Tracker — Rust / ROS 2
+# Object Tracking — Rust / ROS 2 / YOLOE + NanoTrack
 
-使用一張目標截圖，追蹤影片或 ROS 2 相機 topic 中的單一物件。採用 **NanoTrack v2 學習式追蹤 + SIFT/MAGSAC 全圖重新定位**。執行程式、模型推論、後處理、ROS adapter 與一次性目標發布工具均使用 Rust，無 Python 執行相依。
+輸入連續影像與一張目標截圖，輸出單一物件的 bounding box。
 
-目標圖只需傳一次。程式保留它的特徵，直到新的有效目標圖到達；不需要每個影格重傳截圖。新圖驗證失敗時保留舊目標。程式不會自動理解截圖中的哪個物件才是目標：請提供緊貼物件的裁圖，或設定 `--target-roi` 排除背景。
+**v0.3 起，全圖搜尋改為 YOLOE 視覺提示偵測，已移除 SIFT/MAGSAC 搜尋。** NanoTrack v2 保留作連續局部追蹤。目標截圖只需送一次，Rust 計算並保留 visual prompt embedding，直到新的有效截圖到達。換目標不需要重新匯出模型，不需要文字類別，也不會啟動 Python 推論服務。
 
-> 這是可執行、可驗證的混合式追蹤起點，並非已對任意機器人場景保證的追蹤方案。NanoTrack 分數不是身分正確率。嚴重模糊、完全遮擋、相似物件和從未看過的背面仍可能失敗。已執行與尚未執行的驗證，請見 [驗證紀錄](docs/VALIDATION.md)。
+執行期的影像處理、YOLOE/NanoTrack 推論、目標切換、bbox 後處理與 ROS 2 adapter 均為 Rust。Python 只用於**一次性的 YOLOE 模型匯出**，可在另一台電腦完成。機器人上只需要原生 OpenCV、ONNX Runtime 與匯出的模型。
 
-## 1. 支援的組合
+> YOLOE 的視覺提示是外觀／類別條件，不是實體身分保證。相同外觀的多個物件仍可能混淆，從未看過的背面、遮擋、模糊也不保證能辨識。多個候選分數接近時輸出 `ambiguous`，不猜框。驗證範圍見 [docs/VALIDATION.md](docs/VALIDATION.md)。
 
-| 項目 | 輸入／輸出 | 說明 |
+## 1. 輸入與輸出
+
+| 項目 | 選項／格式 | 行為 |
 |---|---|---|
-| 連續影像 | `--video demo.mp4` | 影片檔，依 FPS 節奏讀取，不跳過影格；推論較慢時播放也較慢 |
+| 連續影像 | `--video demo.mp4` | 讀取影片，每幀處理；依 FPS 節奏讀取，運算慢時播放也較慢 |
 | 連續影像 | `--video camera:0` | OpenCV 攝影機 index |
-| 連續影像 | `--video rtsp://...` | OpenCV backend 支援的 RTSP/HTTP；編碼支援取決於本機 FFmpeg/GStreamer |
-| 連續影像 | `--image-topic /camera/image_raw` | ROS 2 `sensor_msgs/msg/Image` |
-| 連續影像 | 加 `--image-compressed` | topic 改用 `sensor_msgs/msg/CompressedImage` |
-| 目標參考 | `--target object.jpg` | 啟動時載入並保留 |
-| 目標參考 | `--target-topic /tracker/target_image` | 每收到一張有效圖，替換目標並重新定位 |
-| 目標參考 | 加 `--target-compressed` | topic 改用 `sensor_msgs/msg/CompressedImage` |
-| 主要輸出 | `/tracker/bbox` | 自訂 `mobile_tracker_interfaces/msg/TrackingResult`，含 bbox、header、有效旗標、目標版本與狀態 |
-| 文字輸出 | stdout、`--jsonl results.jsonl` | 一行一個 JSON；診斷訊息只寫 stderr |
+| 連續影像 | `--video rtsp://...` | 依本機 FFmpeg/GStreamer 支援的串流 |
+| 連續影像 | `--image-topic /camera/image_raw` | ROS `sensor_msgs/msg/Image` |
+| 連續影像 | 加 `--image-compressed` | 改為 `sensor_msgs/msg/CompressedImage` |
+| 目標截圖 | `--target object.jpg` | 啟動時載入，保留 visual embedding |
+| 目標截圖 | `--target-topic /tracker/target_image` | 每張有效新圖片作為換目標事件；平時不必重傳 |
+| 目標截圖 | 加 `--target-compressed` | 改用 `CompressedImage` |
+| ROS 結果 | `/tracker/bbox` | `mobile_tracker_interfaces/msg/TrackingResult` |
+| 文字結果 | stdout／`--jsonl results.jsonl` | 一行一筆 JSON；診斷寫 stderr |
 
-影片／ROS 串流 × 圖片／ROS 截圖四種組合均支援。`--target` 和 `--target-topic` 可以同時指定：先用檔案初始化，之後接收新的目標。連續影像來源二選一。
+影片／ROS 串流 × 圖片／ROS 截圖四種組合皆可。連續影像來源二選一；`--target` 與 `--target-topic` 可以同時指定，先用檔案初始化再接收換目標事件。影片模式加 `--ros` 也可發布 ROS bbox。
 
-單純影片模式不需要安裝 ROS。影片輸入也能加 `--ros` 發布 ROS bbox。程式無 GUI，不需要桌面環境。
+**截圖中有背景時**，請傳緊貼物件的裁圖，或使用 `--target-roi X,Y,W,H`。ROI 位於截圖原始座標，不是串流座標；會套用到每張新截圖。程式不會自動知道截圖裡你想追哪個物件，也沒有自動前景分割。YOLOE prompt mask 排除 letterbox padding，但不能排除裁圖內的背景。
 
-## 2. 系統與安裝
+## 2. 安裝與模型準備
 
-設計支援以下 ROS 2 平台；這不表示已在兩者完成實機測試，實際驗證範圍見驗證紀錄。
+目標平台為 Ubuntu 22.04 / ROS 2 Humble、Ubuntu 24.04 / ROS 2 Jazzy。單純影片模式不需要 ROS。設計相容性與實際測試平台的差異見驗證紀錄。
 
-| 平台 | ROS 版本 |
-|---|---|
-| Ubuntu 22.04 | Humble |
-| Ubuntu 24.04 | Jazzy |
-
-使用 Rust stable（1.89 以上；以 `Cargo.lock` 固定 Rust 相依）、OpenCV 4.5.4 以上、libclang 和 C++ 編譯工具。學習式模型使用 OpenCV DNN 的 CPU backend，不要求 CUDA，也不使用 OpenCV `TrackerNano` API，因此不要求新版 tracking 模組。SIFT 與 MAGSAC 由 OpenCV 提供。
-
-### 2.1 安裝原生相依
+需求：Rust stable **1.89+**、OpenCV **4.5.4+**（含 DNN）、libclang、C++ 編譯工具，以及提供 **ONNX Runtime 1.22 API 或以上**的原生共享函式庫。YOLOE 使用 CPU ONNX Runtime，NanoTrack 使用 OpenCV DNN CPU backend；不要求 CUDA。
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake pkg-config clang libclang-dev \
-  libopencv-dev curl git
-# 若尚未安裝 Rust，依 https://rustup.rs 安裝 stable toolchain
+sudo apt install -y build-essential cmake pkg-config clang libclang-dev libopencv-dev curl git
+# 尚未安裝 Rust 時，依 https://rustup.rs 安裝 stable toolchain
 rustc --version
 cargo --version
 pkg-config --modversion opencv4
-```
 
-### 2.2 下載與驗證模型
-
-```bash
 git clone https://github.com/noName-ll/object-tracking.git
 cd object-tracking
+```
+
+### 2.1 NanoTrack 模型
+
+```bash
 bash scripts/download_models.sh
 ```
 
-模型不放進 Git，下載腳本會檢查 SHA-256，已存在且校驗正確時不重下載。來源為 HonglinChu/SiamTrackers 的 NanoTrack v2，不可任意替換成 v1/v3 或其他匯出格式。
+腳本只下載兩個 NanoTrack v2 ONNX，並做 SHA-256 校驗；它不下載／匯出 YOLOE。
 
-| 檔案 | SHA-256 |
+| 模型 | SHA-256 |
 |---|---|
 | `models/nanotrack_backbone_sim.onnx` | `530bdd0cd00f19afab79a863e71ba71e3312395a5dc9151af675082bdaaa2fc4` |
 | `models/nanotrack_head_sim.onnx` | `0d8c0637be849f092cc7236cae02e55c8b9455ebe37ba50601d6115db4247cd9` |
 
-模型／演算法來源與授權見 [THIRD_PARTY.md](THIRD_PARTY.md)。
+### 2.2 一次性匯出 YOLOE 視覺提示模型
 
-### 2.3 不使用 ROS 的編譯
+必須使用本專案的兩輸入匯出方式。一般 `yolo export` 產生的固定類別模型，或 prompt-free YOLOE，不能動態接收新目標截圖。
+
+以下可以在開發電腦執行，建議使用 Python 3.10–3.12 的獨立環境：
+
+```bash
+python3 -m venv .export-venv
+source .export-venv/bin/activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -r scripts/requirements-yoloe-export.txt
+python scripts/export_yoloe.py --model yoloe-v8s-seg.pt --size 640 --output models/yoloe
+```
+
+匯出工具固定 `ultralytics==8.3.203`，會下載官方 checkpoint，並輸出：
+
+- `models/yoloe/encoder.onnx`：截圖＋單一物件提示遮罩 → `[1,1,512]` visual embedding。
+- `models/yoloe/detector.onnx`：串流影像＋該 embedding → `[1,N,5]` 候選，欄位為 `cx,cy,w,h,score`。
+- `models/yoloe/manifest.json`：匯出尺寸、格式、版本及兩個 ONNX 的 SHA-256。
+
+工具會實際執行 ONNX checker、PyTorch／ONNX Runtime 數值比對，以及「替換 embedding 後分數是否改變」的檢查。這兩個模型**不包含任何使用者目標截圖**；日後換圖只需執行 encoder，不需重新匯出。
+
+模型有固定 batch=1、單一視覺類別、固定影像尺寸。`--yoloe-size` 必須與匯出的 `--size` 一致。輸出只保留 bbox／score，不輸出分割 mask。預設為 YOLOE-v8s-seg 的視覺提示模式，不支援任意 YOLO/YOLOE 檔案直接替換。
+
+### 2.3 設定原生 ONNX Runtime
+
+Rust 使用 `ort` 動態載入原生 Runtime，透過 `ORT_DYLIB_PATH` 指定**共享函式庫檔案**，不是資料夾。
+
+在上面的匯出電腦，可直接使用已安裝的 CPU wheel 內的原生函式庫：
+
+```bash
+export ORT_DYLIB_PATH="$(find "$PWD/.export-venv" -type f -name 'libonnxruntime.so.*' -print -quit)"
+test -f "$ORT_DYLIB_PATH"
+deactivate
+```
+
+這只是使用 wheel 內的原生 `.so`，Rust 執行期不會啟動 Python。正式部署可改用 [ONNX Runtime 官方發行包](https://github.com/microsoft/onnxruntime/releases)中的原生函式庫：
+
+```bash
+# 範例：依你的實際安裝位置調整
+export ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so.1.23.2
+```
+
+將兩個 ONNX 和 `manifest.json` 複製到機器人的 `models/yoloe/`。原生 Runtime 必須符合機器人的 CPU 架構／作業系統；不要將 x86_64 的 `.so` 複製給 ARM64。必要時將 Runtime 的相依函式庫目錄加入 `LD_LIBRARY_PATH`。新終端也要設定 `ORT_DYLIB_PATH`。
+
+模型與 Runtime 二進位不放進 Git；Ultralytics／YOLOE 的授權與本專案 Apache-2.0 不同，見 [THIRD_PARTY.md](THIRD_PARTY.md)。
+
+### 2.4 編譯 Rust
 
 ```bash
 cargo build --release --locked
 ./target/release/mobile-object-tracker --help
 ```
 
-### 2.4 ROS 2 編譯
+### 2.5 編譯 ROS 2
 
-先安裝 ROS 2 Humble 或 Jazzy，再開一個乾淨終端；不要同時 source 不同發行版。
+先安裝 ROS 2，再 source 單一發行版，不要混用 Humble/Jazzy：
 
 ```bash
-# Humble；Jazzy 改成 /opt/ros/jazzy/setup.bash
-source /opt/ros/humble/setup.bash
+source /opt/ros/humble/setup.bash  # Jazzy 改成 /opt/ros/jazzy/setup.bash
 sudo apt install -y python3-colcon-common-extensions \
   ros-${ROS_DISTRO}-rosidl-default-generators \
   ros-${ROS_DISTRO}-sensor-msgs ros-${ROS_DISTRO}-std-msgs
 bash scripts/build_ros2.sh
-```
-
-`python3-colcon-common-extensions` 是 ROS 的建置工具，不是追蹤程式的執行相依。腳本先以 colcon 建置訊息，再 source 訊息 overlay，最後用 Cargo 建置 Rust 執行檔。Rust 執行檔不透過 `ros2 run` 啟動，直接執行即可。
-
-手動步驟等同：
-
-```bash
-colcon build --base-paths ros2 --build-base build/interfaces \
-  --install-base install/interfaces --packages-select mobile_tracker_interfaces
 source install/interfaces/setup.bash
-export IDL_PACKAGE_FILTER='builtin_interfaces;std_msgs;sensor_msgs;geometry_msgs;unique_identifier_msgs;action_msgs;mobile_tracker_interfaces'
-cargo build --release --locked --features ros2
 ```
 
-`r2r` 會根據已 source 的 ROS 安裝生成 binding。自訂訊息必須在 Rust 編譯前可見；新增／變更 `.msg` 或切換 ROS 發行版後，重新建置 interfaces，再執行 `cargo clean` 和完整編譯。不要用 `--all-features` 建立正式執行檔：`ros2-doc` 只是無 ROS 環境中的型別檢查功能，無法連結成可用的 ROS node。
+`colcon` 是 ROS 建置工具；追蹤程式仍以 Rust 執行。腳本先建置 custom message，再 source overlay，最後 `cargo build --release --locked --features ros2`。
 
-每個執行終端都要：
+**從 v0.2 升級必須重新建置 custom message 和 Rust**：TrackingResult 增加 `search_score`，請讓發布端與訂閱端使用相同的新 interface。切換 ROS 發行版或 message schema 時，重新建置 interfaces、source overlay，再 `cargo clean` 並重新編譯 Rust。
+
+每個 ROS 執行終端均需：
 
 ```bash
 source /opt/ros/humble/setup.bash  # 或 jazzy
 source install/interfaces/setup.bash
-# 若其他 node 使用非預設 domain，請設定相同的值
-export ROS_DOMAIN_ID=0
+export ROS_DOMAIN_ID=0             # 與其他 node 保持一致
+export ORT_DYLIB_PATH=/你的路徑/libonnxruntime.so.1.23.2
 ```
 
-## 3. 執行範例
+Rust 執行檔直接執行，不透過 `ros2 run`。不要用 `--all-features` 部署：`ros2-doc` 僅供無 ROS 環境的型別檢查，無法建立可執行的 ROS node。
 
-### A. 影片 + 圖片，不使用 ROS
+## 3. 使用方式
+
+### 影片 + 圖片
 
 ```bash
 ./target/release/mobile-object-tracker \
@@ -118,73 +150,50 @@ export ROS_DOMAIN_ID=0
   --target-roi 120,80,240,300 --jsonl results.jsonl
 ```
 
-ROI 是目標截圖原始解析度中的 `x,y,width,height`，不是影片中的位置。已裁好的物件圖可省略 ROI。未指定時整張圖都會建立特徵；背景多時容易匹配到背景。
+已經裁好的圖片可省略 `--target-roi`。程式無 GUI，不需要桌面。
 
-### B. ROS 相機 + 圖片，輸出 ROS bbox
+### ROS 相機 + 圖片
 
 ```bash
 ./target/release/mobile-object-tracker \
-  --image-topic /camera/color/image_raw \
-  --target object.jpg --bbox-topic /tracker/bbox
+  --image-topic /camera/color/image_raw --target cropped_object.jpg
 ```
 
-### C. ROS 相機 + 一次性 ROS 目標截圖
+### ROS 相機 + 一次性目標 topic
 
 先啟動追蹤器：
 
 ```bash
 ./target/release/mobile-object-tracker \
-  --image-topic /camera/color/image_raw \
-  --target-topic /tracker/target_image
+  --image-topic /camera/color/image_raw --target-topic /tracker/target_image
 ```
 
-再從另一個已 source ROS 和 overlay 的終端送一次目標圖：
+另一個已 source ROS/overlay 的終端，只發一張截圖：
 
 ```bash
 ./target/release/send-target --file cropped_object.jpg
-```
-
-`send-target` 會先等相容 subscriber 出現，最多 10 秒；發送一張 BGR8 圖片後，再保持 publisher 存活 2 秒。它不會循環發送圖片。追蹤器接收成功後會保留目標，即使發布工具結束也可繼續追蹤。
-
-換追蹤物時再執行一次：
-
-```bash
+# 需要換目標時才再送一張
 ./target/release/send-target --file another_object.jpg
 ```
 
-每張成功接收的有效目標圖都視為新的目標事件，即使內容相同也會增加版本。尚未收到目標時，對每張串流畫面輸出 `waiting_target`。無效目標圖會被拒絕並記錄 stderr，原目標與版本保持不變。
+`send-target` 先等相容 subscriber，最多 10 秒，發送一次 BGR8 後保持 publisher 存活 2 秒。追蹤器收到後將 embedding 留在記憶體，不需要持續送截圖；尚未收到有效目標時輸出 `waiting_target`。
 
-如果要讓追蹤器在發布後才啟動，也能收到那張圖：發布端與訂閱端都設定 transient local，且**發布端必須保持存活**：
+新圖先完成解碼、ROI、尺寸和 embedding 檢查，成功後才增加 `target_generation` 並清除舊 NanoTrack 狀態。驗證失敗保留舊 embedding／版本。每張有效新圖都視為換目標，即使圖片內容相同。新圖通過 embedding 檢查不代表一定能在串流內找到物件。
 
-```bash
-# 追蹤器
-./target/release/mobile-object-tracker \
-  --image-topic /camera/color/image_raw \
-  --target-topic /tracker/target_image --target-durability transient-local
-
-# 發布一次後長時間保持 publisher 存活；等待 subscriber 的時間也可調長
-./target/release/send-target --file cropped_object.jpg \
-  --transient-local --wait-seconds 60 --keep-alive-seconds 3600
-```
-
-Transient local 不會在 publisher 結束後替你永久保存資料。預設 volatile 模式，請先啟動追蹤器再送截圖。這兩種模式的差別是 DDS 是否提供晚加入者歷史資料；都不影響追蹤器收到後在記憶體中保留目標。程式重啟後，記憶體中的目標會消失。
-
-### D. 影片 + ROS 目標截圖，輸出 ROS bbox
+### 影片 + 一次性目標 topic
 
 ```bash
 ./target/release/mobile-object-tracker \
   --video demo.mp4 --target-topic /tracker/target_image
-./target/release/send-target --file cropped_object.jpg
 ```
 
-### E. 影片 + 圖片，也發布 ROS bbox
+### 影片 + 圖片，也發布 ROS bbox
 
 ```bash
-./target/release/mobile-object-tracker \
-  --video demo.mp4 --target object.jpg --ros
+./target/release/mobile-object-tracker --video demo.mp4 --target object.jpg --ros
 ```
 
-### F. 壓縮 topic
+### 壓縮 topic
 
 ```bash
 ./target/release/mobile-object-tracker \
@@ -192,32 +201,98 @@ Transient local 不會在 publisher 結束後替你永久保存資料。預設 v
   --target-topic /tracker/target/compressed --target-compressed
 ```
 
-這裡直接訂閱 `CompressedImage`，不是 `image_transport` 外掛。ROS topic 型別必須與選項一致；本專案的 `send-target` 只發原始 `Image`。
+直接訂閱 `CompressedImage`，不是 image_transport plugin。`send-target` 只發布 raw `Image`。
 
-## 4. ROS 輸入規格與 QoS
+### 晚加入的訂閱者
 
-### 連續影像 topic
+預設目標 subscriber 為 reliable + volatile；應先開追蹤器，再送一次目標圖。若要接收仍存活的 publisher 保存的上一張圖片，兩端均使用 transient local：
 
-- 預設型別 `sensor_msgs/msg/Image`，支援 `bgr8`、`rgb8`、`mono8`、`bgra8`、`rgba8`。
-- 正確處理 `step` 的每行 padding；8-bit 資料不需要位元組序交換。
-- 不接受 `16UC1` 深度圖、YUV、Bayer、浮點影像；請在上游轉成支援的色彩影像。
-- 選用壓縮輸入時，JPEG／PNG 等格式由 OpenCV decoder 決定；不是深度壓縮格式 `compressedDepth`。
-- 使用 best-effort、volatile、keep-last depth=1，能連接常見的 sensor-data publisher。
-- 每次 polling 取已交付訊息中的最新圖，避免為已過時的影像排長隊；這不是全系統零延遲保證。
-- 原始圖轉換有 256 MiB 上限，壓縮資料有 64 MiB 上限。
+```bash
+./target/release/mobile-object-tracker \
+  --image-topic /camera/image_raw --target-topic /tracker/target_image \
+  --target-durability transient-local
 
-### 目標參考 topic
+./target/release/send-target --file object.jpg --transient-local \
+  --wait-seconds 60 --keep-alive-seconds 3600
+```
 
-- 型別和影像編碼與連續影像相同，獨立指定是否為 compressed。
-- reliable、keep-last depth=1；durability 預設 volatile，可切換 transient-local。
-- 上游也應使用 reliable。best-effort publisher 與此 reliable subscriber 不相容。
-- 每張圖片作為替換事件。若短時間送很多張，只採用已交付佇列中最後一張，不保證處理每個中間目標。
-- `--target-roi` 若有指定，會套用於檔案和每張 ROS 目標圖；各截圖尺寸不同時，建議先裁成物件圖並省略 ROI。
-- 截圖的 header 不用來同步串流；輸出 header 來自被處理的串流畫面。跨來源截圖只作外觀參考。
+Transient local 不會在 publisher 結束後永久保存圖片。程式重啟也不會保留記憶體中的目標；要再次送圖或提供檔案。
 
-### 輸出 topic
+## 4. 演算法流程
 
-`--bbox-topic` 預設 `/tracker/bbox`，reliable、volatile、keep-last depth=1。每張已處理的畫面發布一次，另外在目標切換、來源逾時、影片結束時發布無效結果。輸出型別是自訂訊息，**不是** `vision_msgs/Detection2DArray` 或字串包 JSON。
+```mermaid
+flowchart TD
+  A[圖片檔 / 一次性目標 topic] --> B[解碼、使用者 ROI]
+  B --> C[RGB /255、letterbox、物件遮罩]
+  C --> D[YOLOE encoder: visual embedding]
+  D --> E[成功才替換目標、版本加一、清除 NanoTrack]
+  F[影片 / ROS 串流] --> G[解碼、縮放、模糊檢查]
+  G -->|模糊| H[blurred、無框]
+  G -->|清晰| I{NanoTrack 已初始化?}
+  I -->|是| J[NanoTrack 局部追蹤]
+  I -->|否| K[YOLOE 全圖搜尋 + 保存的 embedding]
+  J -->|低分 / 定期驗證 / 到期| K
+  K --> L[分數閘門、還原座標、NMS]
+  L -->|多個相近候選| M[ambiguous、無框]
+  L -->|單一候選| N[與模型框比對、初始化 NanoTrack]
+  L -->|無候選且無有效模型| O[lost、繼續全圖搜尋]
+  J -->|高分且最近驗證未過期| P[tracking_model]
+  N --> Q[原始解析度 bbox + ROS / JSONL]
+  P --> Q
+```
+
+### 4.1 目標 embedding
+
+1. 目標圖轉 BGR8，依 `--target-roi` 裁出物件；無 ROI 時整張圖就是提示。
+2. 使用中心 letterbox 縮放到預設 640×640，padding 值為 114。
+3. RGB、NCHW float32，除以 255。不同於 NanoTrack 的 RGB 0–255。
+4. 在 P3 尺度建立 `[1,1,80,80]` 二值 mask，只覆蓋圖片內容，不包含 padding；裁圖內的背景仍屬於 prompt。
+5. encoder 以 `images`、`visuals` 為輸入，輸出正規化的 `[1,1,512]` embedding。檢查形狀、有限值和非零能量後才提交新目標。
+6. 保留 embedding；後續每幀不重跑目標 encoder。
+
+### 4.2 YOLOE 全局搜尋
+
+- 初次定位、NanoTrack 低分、定期驗證、最近驗證到期時，將**整張目前畫面** letterbox 至模型輸入大小。
+- detector 輸入 `images` + 保存的 `embeddings`，單一視覺類別輸出 `[1,N,5]`，不是固定 COCO 類別，也不需要文字提示。
+- 解碼為 bbox，拒絕 NaN、無限值、非法 score、小於 5 像素的框；還原 letterbox 與 padding，裁切至畫面內。
+- 依 `--search-score` 過濾，以 `--search-iou` 做單類 NMS，最多處理分數最高的 300 個 proposals。
+- NMS 後若最高兩個不同位置候選的分數差小於 `--search-margin`，輸出 `ambiguous`；否則選最高分。
+- 若 YOLOE 與有效 NanoTrack 框 IoU < 0.1，也輸出 `ambiguous` 並清除短期追蹤，避免同幀直接跳到另一個位置。
+- 搜尋成功用當前畫面初始化 NanoTrack，重設最近驗證時間。沒有 SIFT 特徵數要求，亦不使用單應性。
+
+分數差閘門只降低明顯多候選歧義，不是 ReID 或實體身分驗證。不同物件的分數差較大時仍可能選錯。
+
+### 4.3 NanoTrack 連續追蹤
+
+NanoTrack v2 使用模板 127×127、搜尋區 255×255；CPU OpenCV DNN。RGB float32 0–255、不除以 255。Backbone 提取特徵，head 的 `input1`/`input2` 輸出 `[1,2,16,16]` 分類與 `[1,4,16,16]` 距離回歸。
+
+Rust 使用 softmax、尺度／長寬比懲罰與 Hann window 選候選；stride=16、penalty=0.055、window influence=0.455、尺寸更新率基數=0.37。用候選的**原始前景 softmax**做 `--model-score` 閘門，低分不寫回狀態。
+
+每 `--verify-every` 個處理影格做 YOLOE 全圖驗證。若這次 YOLOE 沒有候選，但模型仍高分，最多允許在最近一次成功 YOLOE 驗證後 `--verification-ttl-ms` 內繼續。逾時就輸出 lost。此時間使用程序單調時鐘，不是影片媒體時間。YOLOE 有多個相近候選時，即使模型高分也暫停輸出框。
+
+原始截圖 embedding 不會被預測框自動更新，避免參考漂移；NanoTrack 模板只由成功 YOLOE 定位重新初始化。相機背景可移動，但大幅運動仍可能令局部搜尋失敗，再由 YOLOE 搜尋全圖。
+
+### 4.4 模糊與來源中斷
+
+- 全畫面縮小後量測灰階 Laplacian variance；低於 `--blur-threshold` 輸出 blurred、清掉 NanoTrack，不拿舊框或運動預測充當觀測。
+- 清晰後用保存的 embedding 重新全圖搜尋。低紋理畫面也可能低分，可設 `--blur-threshold 0` 停用此閘門。
+- 未加入去模糊模型、Kalman 預測、里程計或相機運動補償。縮短曝光、補光和降低速度仍很重要。
+- 來源尺寸改變或處理間隔超過 `--gap-timeout-ms`，清掉短期狀態再搜尋。
+- ROS 相機沒有新訊息超過 `--source-timeout-ms`，發布無效心跳。若 publisher 持續發舊 stamp，仍需下游檢查時間戳。
+
+## 5. ROS topic、編碼與 QoS
+
+| Topic | 預設型別 | QoS |
+|---|---|---|
+| 連續影像，名稱由使用者指定 | `sensor_msgs/msg/Image` | best-effort、volatile、keep-last depth=1 |
+| 目標截圖，名稱由使用者指定 | `sensor_msgs/msg/Image` | reliable、depth=1；volatile 或指定 transient-local |
+| `/tracker/bbox`，可改 `--bbox-topic` | `mobile_tracker_interfaces/msg/TrackingResult` | reliable、volatile、depth=1 |
+
+Raw 支援 `bgr8/rgb8/mono8/bgra8/rgba8`，正確處理 `step` 的行距 padding；不接受深度、Bayer、YUV、float 等，請上游先轉換。raw 轉換上限 256 MiB，compressed buffer 上限 64 MiB。壓縮格式由 OpenCV decoder 支援度決定，不支援 compressedDepth。
+
+目標 publisher 應使用 reliable；best-effort publisher 與 reliable subscriber 不相容。每次 polling 取已交付佇列中的最新圖片，短時間多張目標可能只處理最後一張。影像取得、ROS spin、encoder 與追蹤依序處理，不會在推論中間平行替換目標。
+
+截圖 header 只作外觀參考，不用來同步影像。輸出保留**串流影像**的 stamp/frame_id，目標 embedding 計算不影響此來源定義。
 
 ```bash
 ros2 interface show mobile_tracker_interfaces/msg/TrackingResult
@@ -225,189 +300,124 @@ ros2 topic echo /tracker/bbox
 ros2 topic info /tracker/bbox --verbose
 ```
 
-## 5. Bounding box 與結果格式
+## 6. 輸出欄位
 
-座標一律是**原始串流解析度的像素座標**，不是縮小推論圖，也不是目標截圖的座標。原點在左上角，x 向右、y 向下。使用軸對齊 bbox；傾斜物件投影的外接矩形可能包含背景。
+bbox 一律是**原始串流解析度像素座標**，不是 YOLOE letterbox、縮小圖或截圖座標。原點左上、x 向右、y 向下，使用軸對齊矩形。
 
-| 欄位 | 型別 | 意義 |
+| 欄位 | 意義 |
+|---|---|
+| `header` | ROS 保留來源 stamp/frame_id；影片是讀取完成的 UTC 系統時間與 `--frame-id`，不是相機曝光／模擬時間 |
+| `sequence` | 來源處理序號；換目標／timeout 事件可重用上一個序號 |
+| `target_generation` | 成功接受目標的版本，從 1 開始，無目標為 0 |
+| `status` | 見下表 |
+| `found` | ROS 是否有有效 bbox；false 時四個座標為 0 |
+| `x,y,width,height` | ROS float32 bbox，裁切至原始畫面範圍 |
+| `image_width,image_height` | 原始來源尺寸 |
+| `model_score` | NanoTrack 原始前景 softmax；沒有模型候選時為 0 |
+| `search_score` | 本幀被選中 YOLOE 候選的分數，未執行／未選中為 0；衝突導致無框時可能保留供診斷 |
+| `inliers,inlier_ratio` | 保留舊欄位但**固定為 0**；不再代表驗證品質 |
+| `blur_variance` | 縮小全畫面的 Laplacian variance |
+| `processing_ms` | 影格處理時間，不含擷取、DDS、發布和寫檔；也不含換目標 encoder 的時間 |
+| `has_source_position` | ROS 是否有影片位置 |
+| `source_position_ms` | backend 回報的影片媒體位置；live／ROS 無此位置 |
+
+`model_score` 和 `search_score` 的意義不同，兩者都不是校準過的實體身分正確率。JSONL 用 `bbox:{x,y,width,height}` 或 `bbox:null` 表示有效性，不是 ROS 的展平座標／found；無媒體位置時為 null。
+
+| status | bbox | 含義 |
 |---|---|---|
-| `header` | `std_msgs/Header` | ROS 輸入完整保留串流來源的 stamp/frame_id；影片則使用讀取完成的系統 UTC 時間與 `--frame-id` |
-| `sequence` | uint64 | 已處理／拒絕的來源影格序號；事件訊息可能重用上一個序號 |
-| `target_generation` | uint64 | 成功替換目標的版本，從 1 開始，還沒收到目標為 0 |
-| `status` | string | 見下表 |
-| `found` | bool | ROS 欄位，是否有目前可用的 bbox |
-| `x,y,width,height` | float32 | ROS bbox；已裁切至畫面範圍；`found=false` 時全部為 0 |
-| `image_width,image_height` | uint32 | 原始串流影像尺寸 |
-| `model_score` | float32 | NanoTrack 選定候選的原始前景 softmax，未經身分機率校準；純幾何定位時為 0 |
-| `inliers,inlier_ratio` | uint32/float32 | 本筆成功幾何定位的內點數／比例；沒有成功幾何驗證時為 0 |
-| `blur_variance` | float64 | 縮小串流灰階圖的拉普拉斯變異數，不是通用清晰度機率 |
-| `processing_ms` | float64 | resize、匹配、推論等處理時間，不含串流擷取、DDS、發布與落盤 |
-| `has_source_position` | bool | ROS 欄位，是否有影片位置 |
-| `source_position_ms` | float64 | 影片 backend 回報的媒體位置；ROS／live stream 沒有此位置 |
+| `waiting_target` | 無 | 還沒收到有效目標 |
+| `target_changed` | 無 | ROS 接受新目標並清除舊追蹤 |
+| `tracking_verified` | 有 | 本幀通過 YOLOE 搜尋／一致性門檻，初始化 NanoTrack；名稱沿用舊版，**不再表示幾何驗證** |
+| `tracking_model` | 有 | NanoTrack 高分且最近 YOLOE 驗證未過期 |
+| `lost` | 無 | 沒有可信候選或驗證到期 |
+| `blurred` | 無 | 畫面低於清晰度閾值 |
+| `ambiguous` | 無 | 多個相近候選，或 YOLOE 與 NanoTrack 位置衝突 |
+| `invalid_frame` | 無 | ROS 解碼／處理失敗 |
+| `source_timeout` | 無 | ROS 相機訊息中斷，週期性發布無效結果 |
+| `source_ended` | 無 | ROS 模式下影片結束／讀取失敗，最後發布一次後退出 |
 
-JSONL 以 `bbox: {x,y,width,height}` 或 `bbox: null` 表示有效性，而不是 ROS 的四個展平欄位。沒有影片位置時 `source_position_ms:null`。例：
+無效事件保留最近相關來源 header，不能當成新的曝光時間；從未收到影格時 header/尺寸為 0。下游務必檢查 found、status、generation 和時間戳新鮮度，不要在無效時繼續使用舊框。bbox 不代表三維距離；結合深度前要對齊來源時間與座標。
 
-```json
-{"header":{"stamp":{"sec":123,"nanosec":456},"frame_id":"camera_optical_frame"},"sequence":42,"source_position_ms":null,"target_generation":2,"status":"tracking_model","bbox":{"x":120.0,"y":80.0,"width":100.0,"height":150.0},"image_width":1280,"image_height":720,"model_score":0.91,"inliers":0,"inlier_ratio":0.0,"blur_variance":132.5,"processing_ms":18.0}
-```
+## 7. 調參與相容性
 
-### 狀態
-
-| status | 是否有 bbox | 含義 |
+| 選項 | 預設 | 意義 |
 |---|---|---|
-| `waiting_target` | 否 | 沒有有效參考圖 |
-| `target_changed` | 否 | ROS 收到新有效目標，立即清掉舊追蹤狀態 |
-| `tracking_verified` | 是 | 本幀通過 SIFT/MAGSAC 幾何驗證，初始化／重新初始化 NanoTrack |
-| `tracking_model` | 是 | 本幀由 NanoTrack 追蹤，仍在最近幾何驗證的有效時間內 |
-| `lost` | 否 | 模型／幾何條件不足，或幾何驗證過期 |
-| `blurred` | 否 | 低於模糊閾值，不發布猜測框並清除短期追蹤 |
-| `ambiguous` | 否 | 模型框與特徵框 IoU < 0.1；拒絕直接跳到另一個候選 |
-| `invalid_frame` | 否 | ROS 影像解碼／格式驗證失敗 |
-| `source_timeout` | 否 | ROS 串流在指定時間內沒有交付新影像；之後持續發無效心跳 |
-| `source_ended` | 否 | 影片 EOF／live backend 讀取失敗，ROS 模式最後發布一次後結束 |
+| `--yoloe-encoder` | models/yoloe/encoder.onnx | 目標 visual encoder |
+| `--yoloe-detector` | models/yoloe/detector.onnx | 接收動態 embedding 的 detector |
+| `--yoloe-size` | 640 | 必須與匯出尺寸相同；64–2048 且為 32 倍數 |
+| `--search-score` | 0.25 | YOLOE 候選分數下限 |
+| `--search-iou` | 0.5 | YOLOE NMS IoU |
+| `--search-margin` | 0.05 | 不同位置前兩名分數差小於此值 → ambiguous；0 停用此門檻 |
+| `--model-score` | 0.75 | NanoTrack 分數閾值 |
+| `--verify-every` | 15 | 定期全圖驗證的已處理影格間隔 |
+| `--verification-ttl-ms` | 5000 | 無再次 YOLOE 驗證可繼續局部追蹤的最大牆鐘時間 |
+| `--max-width` | 960 | 前處理工作圖寬度上限；YOLOE 另做固定尺寸 letterbox |
+| `--blur-threshold` | 25 | 模糊閘門，0 停用 |
+| `--gap-timeout-ms` | 1200 | 超過此處理間隔則重新全圖搜尋 |
+| `--source-timeout-ms` | 1000 | ROS 來源中斷閾值／無效心跳間隔 |
+| `--backbone/--head` | models/nanotrack_*.onnx | NanoTrack v2 模型路徑 |
+| `--frame-id` | camera | 只影響影片，ROS 保留來源 header |
 
-無效事件的 header 保留最近相關來源畫面的 header，不能把事件發布時間解讀為新的相機曝光時間。`source_timeout` 前從未收到畫面時 header 為 0、尺寸為 0。
+已移除 `--min-inliers`、`--min-ratio`，舊啟動腳本需更新。YOLOE／NanoTrack 模型路徑相對於當前工作目錄。不要只降低所有閾值以維持框存在；應測試沒有目標、相似物件、底盤移動、轉面、模糊和遮擋的影片。
 
-下游應同時檢查 `found`、`status`、`target_generation` 與影像時間戳是否新鮮；不要在 `found=false` 時保留上一個框，也不要把 bbox 直接當成三維距離。若要結合深度圖，需以相機 stamp/frame_id 做時間與座標對齊。
+## 8. 限制
 
-## 6. 演算法與資料流程
+- YOLOE 提示相似度沒有實體身分保證；NMS／margin 不是 ReID，候選差距大仍可能追錯。
+- 本版單目標、單 prompt，沒有多視角圖庫、文字提示、prompt-free 模式、自動前景分割或三維定位。
+- 背面或外觀大改時可能找到同類其他物件或找不到；沒有任意轉面／模糊保證。
+- CPU YOLOE 搜尋通常比原本 SIFT 更耗算力，不承諾 FPS；請在目標硬體量測。
+- RTSP／攝影機使用同步 OpenCV 擷取；backend 阻塞會延遲 ROS polling 和 Ctrl-C。未加入獨立擷取執行緒、自動重連或硬性 read deadline。
+- DDS depth=1 減少排隊，但不保證每個影格／短暫目標事件都被處理。低延遲部署優先使用穩定的 ROS image topic。
+- 無目標持久化；重啟後重新送圖。沒有底盤／手臂控制，也不應直接以 bbox 作安全控制依據。
 
-```mermaid
-flowchart TD
-  A[目標圖片檔 / 一次性目標 topic] --> B[裁切 ROI、縮放、SIFT 特徵檢查]
-  B -->|有效| C[保留參考特徵、版本加一、清除舊模型狀態]
-  B -->|無效| D[記錄原因、保留原目標]
-  E[影片 / ROS 串流] --> F[解碼 BGR8、縮放、清晰度檢查]
-  F -->|模糊| G[無效 bbox、blurred]
-  F -->|清晰| H{短期追蹤已初始化?}
-  H -->|是| I[NanoTrack v2 ONNX 推論]
-  H -->|否| J[SIFT 全畫面匹配]
-  I -->|低分 / 定期驗證 / 到期| J
-  J --> K[雙向匹配、ratio test、MAGSAC 單應性、幾何檢查]
-  K -->|定位成功| L[初始化 NanoTrack、更新幾何驗證時間]
-  I -->|高分且驗證未過期| M[tracking_model]
-  K -->|與模型衝突| N[ambiguous、不發布框]
-  K -->|失敗且無可信模型| O[lost、後續繼續全圖搜尋]
-  L --> P[轉回原始解析度 bbox]
-  M --> P
-  P --> Q[ROS TrackingResult + JSONL]
-```
-
-### 6.1 初次定位／重新搜尋
-
-1. 目標截圖套用使用者 ROI，長邊中的寬度上限為 `min(max-width,640)`；串流寬度最多 `max-width`。只在寬度超標時等比例縮小。
-2. 提取 SIFT 關鍵點和浮點描述子。參考圖至少要有 `min-inliers` 個特徵，否則不接受。
-3. BFMatcher L2 找兩個最近鄰；Lowe ratio `<0.75`，再要求反向最近鄰一致。
-4. 用 USAC_MAGSAC 估計參考圖到串流圖的單應性；重投影門檻 4 個推論影像像素，最多 5000 次，confidence=0.999。
-5. 要求內點數至少 `min-inliers`、內點比例至少 `min-ratio`，參考內點凸包覆蓋至少 3.5% 的參考圖面積。
-6. 投影參考圖四角，要求有限數值、凸四邊形、面積至少 100 推論像素²且不超過畫面 1.5 倍、至少 35% 投影面積可見。
-7. 取投影的軸對齊外接 bbox，裁至畫面內，再於當前畫面初始化 NanoTrack。
-
-全圖搜尋用於初次定位、模型低分、定期驗證與幾何驗證到期。它不假設相機背景固定，但如果參考圖帶有大量背景，仍可能對背景建立有效單應性，所以裁圖很重要。
-
-### 6.2 學習式連續追蹤
-
-NanoTrack 是單目標 Siamese 追蹤網路，不是語意偵測器：它比較模板與搜尋區域，預測目標位置，無需先知道物件類別。
-
-- 模板：目標周圍含 context 的正方形 crop，resize 至 127×127。
-- 搜尋：以上一個框中心為中心，context 搜尋區 resize 至 255×255。
-- 色彩：BGR 轉 RGB，float32，值域 0–255，scale=1，不做 ImageNet mean/std。
-- Backbone ONNX 分別取得模板／搜尋特徵；head 的輸入名稱為 `input1`、`input2`。
-- Head 輸出 `output1: [1,2,16,16]` 前景／背景 logits，以及 `output2: [1,4,16,16]` 的 left/top/right/bottom 距離。
-- Rust 對分類做 softmax，搭配尺度、長寬比懲罰與 Hann window 選候選；stride=16、penalty=0.055、window influence=0.455、尺寸更新率基數=0.37。
-- 以選定候選的**原始前景 softmax**做 `model-score` 閘門，不用混合 Hann window 後的分數假裝模型信心。
-- 低分、非法數值或非法 bbox 不寫回追蹤狀態。參考截圖特徵不會被模型結果自動覆寫。
-
-模型能利用連續畫面處理有限的姿態、外觀與尺度變化，但搜尋區是局部的；底盤突然大幅轉動可能把物件移出搜尋區，需要全圖重新定位。
-
-### 6.3 混合驗證與防漂移
-
-每 `verify-every` 個已處理影格做幾何驗證；模型失敗時同幀就執行全圖定位。模型與特徵候選 IoU < 0.1 時輸出 `ambiguous`，先清掉短期狀態，下一幀重新搜尋。
-
-若定期 SIFT 失敗，但 NanoTrack 分數足夠，最多允許在上次幾何驗證後 `verification-ttl-ms` 的時間內繼續模型追蹤。逾時則 `lost`。這是避免模型無限制漂移的策略，也意味著轉到沒有參考特徵的背面超過此時間，會主動放棄。時間限制依處理程序的單調時鐘，不是影片媒體時間。
-
-SIFT 幾何成功也不能保證是原本那個實體，兩個外觀相同的盒子仍可能混淆。本版不含多目標身分管理、ReID、多視角圖庫、自動前景分割或里程計補償。
-
-### 6.4 模糊、丟失與目標切換
-
-在縮小後全畫面上量測 Laplacian variance。低於閾值時輸出 `blurred` 並清掉短期模型，不使用舊框或運動預測當成觀測。低紋理畫面也可能被判為模糊，請依實際相機調整；可用 `--blur-threshold 0` 停用此閘門。
-
-本版沒有去模糊網路、Kalman 預測或相機運動補償。模糊最好先以縮短曝光、補光、降低速度處理。恢復清晰後重新全圖搜尋；若此時物件已轉到參考圖沒有的表面，可能無法重新找到。
-
-新參考圖先完成解碼、ROI 與特徵檢查，成功後才原子替換，`target_generation` 加一，清除模型與幾何驗證時間；下一張串流影像重新全圖定位。沒有新截圖時不做目標替換。
-
-## 7. 調整參數
-
-| 參數 | 預設 | 用途／取捨 |
-|---|---|---|
-| `--max-width` | 960 | 串流推論寬度上限；提高可保留遠方細節但變慢 |
-| `--min-inliers` | 12 | 幾何內點數下限，越高越嚴格 |
-| `--min-ratio` | 0.4 | 幾何內點比例下限 |
-| `--model-score` | 0.75 | 模型原始前景分數門檻，需用實際影片校準 |
-| `--blur-threshold` | 25 | 全畫面 Laplacian variance 門檻，0 停用 |
-| `--verify-every` | 15 | 定期全圖驗證的處理影格間隔 |
-| `--verification-ttl-ms` | 5000 | 未再次通過幾何驗證可繼續模型追蹤的最大牆鐘時間 |
-| `--gap-timeout-ms` | 1200 | 兩次處理相隔太久時丟棄短期位置，重新全圖定位 |
-| `--source-timeout-ms` | 1000 | ROS source silence 的無效心跳間隔／門檻 |
-| `--frame-id` | camera | 只套用影片；ROS 影像保留原 frame_id |
-| `--backbone`, `--head` | models/… | 模型路徑，相對目前工作目錄 |
-
-不要只降低所有門檻來讓框一直存在。建議用正樣本、無目標畫面、相似物件、底盤轉彎、遮擋與模糊影片，一起量測誤追率、丟失率、重定位時間與端到端延遲。
-
-## 8. 執行限制與部署注意
-
-- 本版單一目標、單一 process；無目標圖持久化。重啟時使用檔案參考或再發一次 topic。
-- ROS subscription spin、參考替換與追蹤依序進行；推論期間不會平行替換目標。DDS depth=1 減少排隊，但不能保證每個短暫事件都被處理。
-- RTSP／攝影機擷取使用同步 OpenCV API；backend 阻塞時可能延遲 ROS polling 和 Ctrl-C，未實作獨立擷取執行緒、自動重連或硬性 read deadline。低延遲部署優先用已在上游正常發布的 ROS image topic。
-- ROS 來源逾時用「本程式沒有收到畫面」判斷；仍持續送舊 stamp 的 publisher 不會觸發此逾時，下游必須檢查 stamp 新鮮度。
-- 影片 header 是系統接收時間，不是相機曝光／ROS 模擬時間；媒體位置另記 `source_position_ms`。不支援 `use_sim_time` 的影片時鐘。
-- 裁框沒有物件語意分割，特徵多的背景仍可能主導匹配。
-- 單應性最適合可見的平面表面。物件大幅三維旋轉後，幾何重新定位可能失敗。
-- 模型只用 CPU；未承諾 FPS，需在你的硬體與解析度量測。
-- 不輸出三維位置、距離、姿態，也不控制底盤或機械手臂。
-
-## 9. 測試與原始碼
+## 9. 測試
 
 ```bash
 cargo fmt --check
-cargo test --locked --no-default-features        # 純 Rust 契約／像素資料測試
-cargo test --locked                              # 含原生 OpenCV
-# 下載模型後，執行真正 ONNX 推論與合成場景測試
+cargo test --locked --no-default-features
+cargo test --locked
+# 需匯出兩個 YOLOE、下載 NanoTrack，並設定 ORT_DYLIB_PATH
+bash scripts/download_test_assets.sh
 cargo test --locked --test hybrid -- --ignored --nocapture
-# 已 source ROS 與自訂訊息 overlay 時
-cargo check --locked --features ros2
-# 真正的 ROS graph 測試：一次性目標、更換目標、bbox、header、source timeout
-# 只能在已 source ROS/overlay 且可用 DDS 的環境執行
+# 無 ROS 時只做 Rust 型別與 lint 檢查，不驗證 DDS
+cargo clippy --locked --all-targets --features ros2-doc -- -D warnings
+```
+
+真正 ROS 主機，在建置並 source interfaces、設定 Runtime 後：
+
+```bash
+export IDL_PACKAGE_FILTER='builtin_interfaces;std_msgs;sensor_msgs;geometry_msgs;unique_identifier_msgs;action_msgs;mobile_tracker_interfaces'
 cargo test --locked --features ros2 --test ros_transport -- --ignored --nocapture
 ```
 
-ROS 無法安裝的開發環境可用 `cargo check --locked --features ros2-doc` 做 Rust API 型別檢查；這不代表 ROS graph、DDS QoS 或自訂訊息生成已通過執行測試，也不能用這個 feature 建置部署程式。
+ROS smoke test 只發一次目標，驗證多幀 bbox、第二個目標的版本、header 和 source timeout。自然圖測例是推論煙霧測試，不是追蹤準確率 benchmark。完整已測／未測範圍見 [驗證紀錄](docs/VALIDATION.md)。
 
-| 路徑 | 職責 |
+## 10. 原始碼與故障排查
+
+| 路徑 | 責任 |
 |---|---|
-| `src/nano.rs` | ONNX 推論、搜尋區裁切、NanoTrack 後處理 |
-| `src/tracker.rs` | 參考保留、SIFT/MAGSAC、混合追蹤狀態機 |
-| `src/ros.rs` | ROS 2 image subscriptions、自訂 bbox publisher、source timeout |
-| `src/pixels.rs` | ROS raw buffer 編碼、行距與資料長度檢查 |
-| `src/contract.rs` | bbox、header、JSON／ROS 契約、目標版本槽 |
-| `src/video.rs` | 影片／攝影機擷取與檔案節奏 |
-| `src/cli.rs` | CLI、選項驗證 |
-| `src/bin/send_target.rs` | 一次性發布目標圖的 Rust 工具 |
-| `ros2/mobile_tracker_interfaces/` | ROS 2 自訂訊息 package |
-| `scripts/` | 模型下載與 ROS 建置 |
-| `tests/` | 真正模型推論與合成情境驗證 |
-| `legacy/python/` | 早期 Python 原型，非目前正式實作，不被 Rust 程式呼叫 |
+| `src/yoloe.rs` | 原生 ORT、visual encoder／detector、letterbox、遮罩、解碼、NMS、歧義 |
+| `src/tracker.rs` | 目標保留、YOLOE/NanoTrack 混合狀態機 |
+| `src/nano.rs` | NanoTrack OpenCV DNN、Rust 後處理 |
+| `src/ros.rs` | ROS image subscriptions、bbox publisher、timeout |
+| `src/contract.rs`、`src/pixels.rs` | 訊息契約、bbox 和 raw 編碼／padding |
+| `src/video.rs`、`src/cli.rs` | 影片輸入、CLI 與參數驗證 |
+| `src/bin/send_target.rs` | 一次性目標發布工具 |
+| `scripts/export_yoloe.py` | 一次性匯出，非執行期服務 |
+| `ros2/mobile_tracker_interfaces` | ROS 自訂訊息 |
+| `tests/` | 原生模型、影片 CLI、可選 ROS 通訊測試 |
+| `legacy/python/` | 早期原型，正式 Rust 不會呼叫 |
 
-## 10. 常見問題
+**找不到 Runtime？** ORT_DYLIB_PATH 應是存在的共享函式庫檔案，確認版本 ≥1.22 API、架構與相依庫。不要只填資料夾或 `.onnx` 路徑。
 
-**一開始一直 lost？** 確認模型、參考圖有足夠紋理、物件在畫面內且比例合理；截圖盡量裁掉背景。初次定位仍依賴 SIFT；無紋理物件可能連目標圖都無法接受。
+**模型輸入／shape 不符？** 使用本專案 exporter 的成對模型；--yoloe-size 和匯出尺寸要一致。程式會拒絕固定類別 YOLO、錯誤輸出名稱／輸入形狀。
 
-**轉面後追丟？** 局部模型可處理有限連續變化，但幾何驗證需要原參考表面的特徵。本版不含多視角參考庫；需增加多視角資料、專用偵測／ReID 或識別標記才能改善長時間背面辨識。
+**一直 lost？** 確認目標可見、截圖裁得合理、scale 合理、模型版本一致；觀察 search_score，調整搜尋門檻。
 
-**一直 blurred？** 全畫面紋理少或縮放太小也會降低數值，先檢查 `blur_variance`，再調整門檻。不要把此指標當成相機專用清晰度量測。
+**一直 ambiguous？** 檢查是否有相似目標、背景主導或模型框與全圖候選衝突；降低 margin 只會減少拒絕，不會讓身分判斷變準。
 
-**收不到一次性截圖？** 確認先啟動訂閱端、相同 ROS_DOMAIN_ID、topic 型別／名稱一致、reliable QoS 相容；需要 late joiner 時兩端用 transient local 且發布者仍存活。
+**一直 blurred？** 查看 blur_variance，低紋理和縮放也會低分，調整門檻或設為 0。
 
-**Unknown message type / 找不到 TrackingResult？** 先建置接口並 source overlay，再編譯 Rust；確認 IDL_PACKAGE_FILTER 包含 custom message 與依賴。更換 ROS distro 後清掉 Cargo cache。
+**收不到目標 topic？** 檢查 ROS_DOMAIN_ID、名稱、raw/compressed 型別、reliable／durability，先啟動 subscriber 再送一次目標。
 
-**OpenCV / libclang 找不到？** 確認 `pkg-config --modversion opencv4`、安裝 `libopencv-dev libclang-dev clang`；非標準安裝可依 opencv-rust 說明設定 OPENCV_INCLUDE_PATHS、OPENCV_LINK_PATHS、LIBCLANG_PATH。
+**ROS custom message 不符？** v0.3 增加 search_score，重建 interfaces、所有訂閱端及 Rust binding，再 source overlay。不要用 ros2-doc 執行。
