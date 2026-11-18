@@ -1,5 +1,5 @@
 use crate::{contract::Bbox, tracker::gray};
-use anyhow::{ensure, Result};
+use anyhow::{Context, Result};
 use opencv::{
     calib3d,
     core::{self, DMatch, KeyPoint, Mat, Point2f, Vector},
@@ -29,17 +29,20 @@ fn features(image: &Mat) -> Result<(Vector<KeyPoint>, Mat)> {
 
 impl Reference {
     pub fn encode(image: &Mat) -> Result<Self> {
+        Self::encode_if_supported(image)?
+            .context("reference needs at least 12 SIFT features; choose a clearer view")
+    }
+    pub fn encode_if_supported(image: &Mat) -> Result<Option<Self>> {
         let (keypoints, descriptors) = features(image)?;
-        ensure!(
-            keypoints.len() >= 12,
-            "reference needs at least 12 SIFT features; choose a clearer view"
-        );
-        Ok(Self {
+        if keypoints.len() < 12 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
             keypoints,
             descriptors,
             width: image.cols(),
             height: image.rows(),
-        })
+        }))
     }
     pub fn locate(&self, frame: &Mat) -> Result<Option<(Bbox, usize, f32)>> {
         let reference = self;

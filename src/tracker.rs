@@ -21,6 +21,8 @@ pub struct Config {
     pub search_score: f32,
     pub search_iou: f32,
     pub search_margin: f32,
+    pub template_only: bool,
+    pub appearance_limit: f64,
     pub model_score: f32,
     pub blur_threshold: f64,
     pub verify_every: u64,
@@ -31,7 +33,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            backend: Backend::Features,
+            backend: Backend::Auto,
             max_width: 960,
             yoloe_encoder: "models/yoloe/encoder.onnx".into(),
             yoloe_detector: "models/yoloe/detector.onnx".into(),
@@ -39,6 +41,8 @@ impl Default for Config {
             search_score: 0.25,
             search_iou: 0.5,
             search_margin: 0.05,
+            template_only: false,
+            appearance_limit: 60.,
             model_score: 0.75,
             blur_threshold: 25.0,
             verify_every: 15,
@@ -50,10 +54,13 @@ impl Default for Config {
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum Backend {
+    Auto,
+    SmallTarget,
     Features,
     Yoloe,
 }
 enum Prompt {
+    SmallTarget(crate::small_target::Reference),
     Features(crate::features::Reference),
     Yoloe(Vec<f32>),
 }
@@ -67,6 +74,7 @@ pub struct Engine {
     last_frame: Option<Instant>,
     verified_at: Option<Instant>,
     work_size: Option<Size>,
+    previous_patch: Option<Mat>,
 }
 
 pub fn read_image(path: &str) -> Result<Mat> {
@@ -120,7 +128,7 @@ pub fn blur_variance(image: &Mat) -> Result<f64> {
 impl Engine {
     pub fn new(config: Config, backbone: &str, head: &str) -> Result<Self> {
         let search = match config.backend {
-            Backend::Features => None,
+            Backend::Auto | Backend::Features | Backend::SmallTarget => None,
             Backend::Yoloe => Some(YoloE::load(
                 &config.yoloe_encoder,
                 &config.yoloe_detector,
@@ -143,6 +151,7 @@ impl Engine {
             last_frame: None,
             verified_at: None,
             work_size: None,
+            previous_patch: None,
         })
     }
 
@@ -173,6 +182,15 @@ impl Engine {
         // Compute the candidate prompt before changing the retained target or NanoTrack state.
         let candidate = match self.search.as_mut() {
             Some(yolo) => Prompt::Yoloe(yolo.encode(&selected)?),
+            None if matches!(self.config.backend, Backend::SmallTarget)
+                || (matches!(self.config.backend, Backend::Auto)
+                    && selected.cols().max(selected.rows()) <= 96) =>
+            {
+                Prompt::SmallTarget(crate::small_target::Reference::encode(
+                    &resize(&selected, self.config.max_width.min(160))?,
+                    self.config.template_only,
+                )?)
+            }
             None => Prompt::Features(crate::features::Reference::encode(&resize(
                 &selected,
                 self.config.max_width.min(640),
@@ -187,6 +205,7 @@ impl Engine {
     }
 
     pub fn reset_motion(&mut self) {
+        self.previous_patch = None;
         self.nano.clear();
         self.active = false;
         self.verified_at = None;
@@ -250,11 +269,24 @@ impl Engine {
             result.status = "blurred".into();
             self.reset_motion();
         } else {
-            let learned = if self.active {
+            let mut learned = if self.active {
                 self.nano.update(&work, self.config.model_score)?
             } else {
                 None
             };
+            let guard = matches!(self.reference.value.as_ref(), Some(Prompt::SmallTarget(_)))
+                && self.config.appearance_limit > 0.;
+            if guard {
+                if let (Some((bbox, _)), Some(previous)) = (learned, self.previous_patch.as_ref()) {
+                    let sample = crate::small_target::sample(&work, bbox)?;
+                    let mut diff = Mat::default();
+                    core::absdiff(&sample, previous, &mut diff)?;
+                    let means = core::mean(&diff, &core::no_array())?;
+                    if (means[0] + means[1] + means[2]) / 3. > self.config.appearance_limit {
+                        learned = None;
+                    }
+                }
+            }
             if self.active && learned.is_none() {
                 self.reset_motion();
             }
@@ -270,6 +302,7 @@ impl Engine {
                         .as_mut()
                         .expect("configured YOLOE")
                         .search(&work, prompt)?,
+                    Prompt::SmallTarget(prompt) => prompt.locate(&work)?,
                     Prompt::Features(prompt) => match prompt.locate(&work)? {
                         Some((bbox, count, ratio)) => {
                             result.inliers = count as u32;
@@ -315,6 +348,11 @@ impl Engine {
                 }
             } else {
                 result.status = "lost".into();
+            }
+            if guard {
+                if let Some(bbox) = accepted {
+                    self.previous_patch = Some(crate::small_target::sample(&work, bbox)?);
+                }
             }
             result.bbox = accepted.and_then(|b| {
                 Bbox {

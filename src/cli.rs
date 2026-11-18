@@ -18,7 +18,7 @@ pub enum Durability {
 #[command(group(ArgGroup::new("source").required(true).args(["video","image_topic"])))]
 #[command(group(ArgGroup::new("reference").required(true).multiple(true).args(["target","target_topic"])))]
 pub struct Args {
-    #[arg(long, value_enum, default_value = "features")]
+    #[arg(long, value_enum, default_value = "auto")]
     pub search_backend: crate::tracker::Backend,
     #[arg(long, help = "Video file, RTSP/HTTP URL, or camera:N")]
     pub video: Option<String>,
@@ -79,6 +79,14 @@ pub struct Args {
         help = "Reject similar-score candidates at distinct locations"
     )]
     pub search_margin: f32,
+    #[arg(
+        long,
+        default_value_t = 60.,
+        help = "Maximum mean colour change for small-target motion updates (0 disables)"
+    )]
+    pub appearance_limit: f64,
+    #[arg(long, help = "Disable SIFT fallback in small-target mode")]
+    pub template_only: bool,
     #[arg(long, default_value_t = 0.75)]
     pub model_score: f32,
     #[arg(long, default_value_t = 25.0)]
@@ -142,7 +150,13 @@ impl Args {
             self.verification_ttl_ms > 0 && self.gap_timeout_ms > 0 && self.source_timeout_ms > 0,
             "timeouts must be positive"
         );
+        ensure!(
+            self.appearance_limit.is_finite() && (0.0..=255.).contains(&self.appearance_limit),
+            "appearance-limit must be in [0,255]"
+        );
         Ok(Config {
+            template_only: self.template_only,
+            appearance_limit: self.appearance_limit,
             backend: self.search_backend,
             max_width: self.max_width,
             yoloe_encoder: self.yoloe_encoder.clone(),

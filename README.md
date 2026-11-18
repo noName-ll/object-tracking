@@ -1,6 +1,6 @@
 # Rust 即時物件追蹤與 ROS 2 bounding box
 
-相機持續送畫面，另一個 topic 在指定或更換目標時送一張截圖。預設用 SIFT 比對截圖和當前畫面的局部特徵，以 MAGSAC 驗證位置，接著用 NanoTrack 連續追蹤。可追蹤未預先定義類別的物品。特徵模式只需下載 NanoTrack 權重，安裝時可跳過第 2.2、2.3 節。
+相機持續送畫面，另一個 topic 在指定或更換目標時送一張截圖。預設依截圖（或 ROI）的長邊選擇搜尋方式。96 像素以內用 GrabCut 分離前景、多尺度彩色模板定位，必要時用 SIFT＋MAGSAC 再找一次。較大截圖直接用 SIFT＋MAGSAC。兩者都用 NanoTrack 連續追蹤。可追蹤未預先定義類別的物品。特徵模式只需下載 NanoTrack 權重，安裝時可跳過第 2.2、2.3 節。
 
 ROS 影像接收與 RTSP／攝影機讀取獨立於推論。每個串流保留最新待處理影格，推論落後時跳過中間影格。處理期間若收到換目標事件，丟棄舊搜尋結果。全圖搜尋仍會佔用推論時間，輸出頻率取決於影像尺寸、物件與硬體。
 
@@ -21,13 +21,13 @@ ROS 影像接收與 RTSP／攝影機讀取獨立於推論。每個串流保留�
 
 影片／ROS 串流 × 圖片／ROS 截圖四種組合皆可。連續影像來源二選一；`--target` 與 `--target-topic` 可以同時指定，先用檔案初始化再接收換目標事件。影片模式加 `--ros` 也可發布 ROS bbox。
 
-**截圖中有背景時**，請傳緊貼物件的裁圖，或使用 `--target-roi X,Y,W,H`。ROI 位於截圖原始座標，不是串流座標；會套用到每張新截圖。程式不會自動知道截圖裡你想追哪個物件，也沒有自動前景分割。YOLOE prompt mask 排除 letterbox padding，但不能排除裁圖內的背景。
+**截圖中有背景時**，小圖模式會把一圈邊界當成背景，估計前景遮罩。背景和物體顏色接近或同一截圖有好幾個物體時可能選錯。若可指定目標範圍，可使用 `--target-roi X,Y,W,H`。ROI 位於截圖原始座標，不是串流座標，會套用到每張新截圖。YOLOE prompt mask 排除 letterbox padding，但不能排除裁圖內的背景。
 
 ## 2. 安裝與模型準備
 
 目標平台為 Ubuntu 22.04 / ROS 2 Humble、Ubuntu 24.04 / ROS 2 Jazzy。單純影片模式不需要 ROS。設計相容性與實際測試平台的差異見驗證紀錄。
 
-需求：Rust stable **1.89+**、OpenCV **4.5.4+**（含 DNN）、libclang、C++ 編譯工具。預設搜尋使用 OpenCV SIFT，連續追蹤使用 NanoTrack CPU 推論。YOLOE 模式另需原生 ONNX Runtime。
+需求：Rust stable **1.89+**、OpenCV **4.5.4+**（含 DNN）、libclang、C++ 編譯工具。預設搜尋使用 OpenCV，連續追蹤使用 NanoTrack CPU 推論。YOLOE 模式另需原生 ONNX Runtime。
 
 ```bash
 sudo apt update
@@ -218,10 +218,11 @@ Transient local 不會在 publisher 結束後永久保存圖片。程式重啟�
 ## 追蹤流程與輸出
 
 1. 在截圖中緊貼物件裁切，或提供原始截圖座標的 `--target-roi x,y,w,h`。新截圖驗證成功後才替換舊目標，版本加一。截圖中的背景也可能產生匹配點。
-2. 第一次搜尋在整張工作圖上做 SIFT 雙向最近鄰匹配，ratio test 取 0.75。MAGSAC 估計單應性，需要至少 12 個內點、內點比例至少 40%，並檢查內點覆蓋面積和投影是否在畫面內。
-3. 成功後用框初始化 NanoTrack。預設每 15 個處理影格用截圖重新驗證，模型低分時立即重新搜尋。可用 `--verify-every` 與 `--max-width` 調整速度／細節。平滑、反光物件可能缺少特徵，顯著轉面也可能追丟。若兩件物品有完全相同的圖案，幾何比對仍可能認錯。
-4. 輸出 `/tracker/bbox`，型別為 `mobile_tracker_interfaces/msg/TrackingResult`。只在 `found=true` 時使用 `x,y,width,height`，原點在原始串流影像左上角。ROS header 取自該影格。`target_generation` 識別目標版本，`tracking_verified` 表示搜尋成功，`tracking_model` 表示當前由 NanoTrack 追蹤。遺失或模糊時輸出無效框。
-5. 特徵模式輸出 `inliers` 和 `inlier_ratio`。若要比較 YOLOE，在相同啟動指令加上 `--search-backend yoloe`，這時全圖搜尋使用 visual embedding，輸出 `search_score`。完整選項見 `--help`。
+2. 小圖模式先跑四輪 GrabCut，預先快取遮罩與不同尺寸的前景模板。搜尋時縮小串流至半解析度，在各尺度比較遮罩內 RGB 通道的平方差，空間分離且得分接近的候選會回報 ambiguous。模板沒找到時，將截圖前景外框放大至長邊 180 像素取得 SIFT 特徵再全圖定位。NanoTrack 更新時比較前後框中央區域，顏色差異過大會觸發全圖重搜。可用 `--search-backend small-target` 強制啟用，或用 `--search-backend features` 重現舊版。
+3. SIFT 路徑在整張工作圖上做 SIFT 雙向最近鄰匹配，ratio test 取 0.75。MAGSAC 估計單應性，需要至少 12 個內點、內點比例至少 40%，並檢查內點覆蓋面積和投影是否在畫面內。
+4. 成功後用框初始化 NanoTrack。預設每 15 個處理影格用截圖重新驗證，模型低分時立即重新搜尋。可用 `--verify-every` 與 `--max-width` 調整速度／細節。平滑、反光物件可能缺少特徵，顯著轉面也可能追丟。若兩件物品有完全相同的圖案，幾何比對仍可能認錯。
+5. 輸出 `/tracker/bbox`，型別為 `mobile_tracker_interfaces/msg/TrackingResult`。只在 `found=true` 時使用 `x,y,width,height`，原點在原始串流影像左上角。ROS header 取自該影格。`target_generation` 識別目標版本，`tracking_verified` 表示搜尋成功，`tracking_model` 表示當前由 NanoTrack 追蹤。遺失或模糊時輸出無效框。
+6. `features` 模式輸出 `inliers` 和 `inlier_ratio`。若要比較 YOLOE，在相同啟動指令加上 `--search-backend yoloe`，這時全圖搜尋使用 visual embedding，輸出 `search_score`。完整選項見 `--help`。
 
 ```bash
 ros2 topic echo /tracker/bbox
@@ -241,3 +242,5 @@ cargo test --test hybrid feature_ -- --ignored
 [先前 YOLOE 版本的技術細節](docs/YOLOE-0.3.md) · [YOLOE 驗證紀錄](docs/VALIDATION.md)
 
 [40×40／90×90 截圖、不同背景與真實轉面角度的逐幀驗證](docs/benchmarks/small-targets.md)
+
+[小截圖搜尋版本比較、遮擋與背面重現測試](docs/benchmarks/foreground-search.md)

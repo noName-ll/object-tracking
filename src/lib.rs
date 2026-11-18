@@ -15,3 +15,6 @@ pub mod yoloe;
 
 #[cfg(feature = "vision")]
 mod features;
+
+#[cfg(feature = "vision")]
+mod small_target;

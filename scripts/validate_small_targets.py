@@ -27,30 +27,7 @@ background = cv2.imread("models/yoloe/test_bus.jpg")
 angles = [0, 5, 15, 30, 60, 90, 135, 180, None, 180, 0]
 
 
-def cutout(obj, angle, side):
-    raw = archive.read(f"coil-100/obj{obj}__{angle}.png")
-    im = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-    mask = im.max(axis=2) > 18
-    x, y, w, h = cv2.boundingRect(mask.astype('uint8'))
-    shape = (max(1,round(side*w/max(w,h))), max(1,round(side*h/max(w,h))))
-    return (cv2.resize(im[y:y+h,x:x+w], shape),
-            cv2.resize(mask[y:y+h,x:x+w].astype('uint8'), shape, interpolation=cv2.INTER_NEAREST).astype(bool))
-
-
-def paste(frame, obj, angle, side, x, y):
-    patch, mask = cutout(obj, angle, side)
-    h,w = mask.shape
-    frame[y:y+h,x:x+w][mask] = patch[mask]
-    return np.array([x,y,w,h],float)
-
-
-def iou(a,b):
-    if a is None or b is None:
-        return 0
-    a,b = np.asarray(a),np.asarray(b)
-    intersection = np.maximum(0,np.minimum(a[:2]+a[2:],b[:2]+b[2:])-np.maximum(a[:2],b[:2])).prod()
-    return intersection/(a[2:].prod()+b[2:].prod()-intersection)
-
+from small_target_scene import paste, iou
 
 def features(image):
     rgb = cv2.cvtColor(image,cv2.COLOR_BGR2RGB)
@@ -67,8 +44,8 @@ with tempfile.TemporaryDirectory() as tmp, torch.inference_mode():
         truth=[]
         for i,angle in enumerate(angles):
             frame=cv2.resize(background[500+i*4:900+i*4,100+i*7:640+i*7],(320,240))
-            paste(frame,2,0,58,245,130)
-            truth.append(None if angle is None else paste(frame,obj,angle,70,20+12*i,45+i*3))
+            paste(archive, frame,2,0,58,245,130)
+            truth.append(None if angle is None else paste(archive, frame,obj,angle,70,20+12*i,45+i*3))
             out.write(frame)
         out.release()
         cap=cv2.VideoCapture(video)
@@ -84,10 +61,10 @@ with tempfile.TemporaryDirectory() as tmp, torch.inference_mode():
             for fill in (0.95,0.60):
                 ref=cv2.resize(background[:250,:250],(size,size))
                 side=round(size*fill)
-                paste(ref,obj,0,side,(size-side)//2,(size-side)//2)
+                paste(archive, ref,obj,0,side,(size-side)//2,(size-side)//2)
                 path=str(folder/"target.png")
                 cv2.imwrite(path,ref)
-                proc=subprocess.run(["target/debug/mobile-object-tracker","--video",video,"--target",path],capture_output=True,text=True)
+                proc=subprocess.run(["target/debug/mobile-object-tracker","--search-backend","features","--video",video,"--target",path],capture_output=True,text=True)
                 if proc.returncode and "at least 12 SIFT" not in proc.stderr:
                     raise RuntimeError(proc.stderr)
                 rows=[json.loads(line) for line in proc.stdout.splitlines()]
