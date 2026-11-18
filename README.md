@@ -239,3 +239,5 @@ cargo test --test hybrid feature_ -- --ignored
 ```
 
 [先前 YOLOE 版本的技術細節](docs/YOLOE-0.3.md) · [YOLOE 驗證紀錄](docs/VALIDATION.md)
+
+[40×40／90×90 截圖、不同背景與真實轉面角度的逐幀驗證](docs/benchmarks/small-targets.md)
