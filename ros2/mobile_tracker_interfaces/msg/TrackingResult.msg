@@ -18,7 +18,7 @@ uint32 image_height
 float32 model_score
 # YOLOE visual-prompt probability on global-search frames; not identity confidence.
 float32 search_score
-# Legacy fields retained for compatibility; always zero with YOLOE.
+# SIFT geometric verification metrics; zero on frames without a feature match.
 uint32 inliers
 float32 inlier_ratio
 float64 blur_variance

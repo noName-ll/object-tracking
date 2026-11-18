@@ -22,6 +22,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Default)]
+struct Inbox {
+    epoch: u64,
+    target: Option<Image>,
+    frame: Option<(Image, Instant)>,
+}
+
 enum Image {
     Raw(r2r::sensor_msgs::msg::Image),
     Compressed(r2r::sensor_msgs::msg::CompressedImage),
@@ -139,16 +146,44 @@ pub fn run(
         Durability::Volatile => r2r::qos::DurabilityPolicy::Volatile,
         Durability::TransientLocal => r2r::qos::DurabilityPolicy::TransientLocal,
     };
-    let mut target = args
-        .target_topic
-        .as_ref()
-        .map(|topic| subscribe(&mut node, topic, args.target_compressed, target_qos))
-        .transpose()?;
-    let mut camera = args
-        .image_topic
-        .as_ref()
-        .map(|topic| subscribe(&mut node, topic, args.image_compressed, camera_qos))
-        .transpose()?;
+    // Keep DDS reception independent of synchronous detector and tracker inference.
+    let mailbox = Arc::new(std::sync::Mutex::new(Inbox::default()));
+    let inbox = Arc::clone(&mailbox);
+    let image_topic = args.image_topic.clone();
+    let target_topic = args.target_topic.clone();
+    let image_compressed = args.image_compressed;
+    let target_compressed = args.target_compressed;
+    let receiver_context = context.clone();
+    let stop = running.clone();
+    let (ready, startup) = std::sync::mpsc::sync_channel(1);
+    let receiver = std::thread::spawn(move || -> Result<()> {
+        let mut reader = r2r::Node::create(receiver_context.clone(), "tracker_input", "")?;
+        let mut target = target_topic
+            .map(|topic| subscribe(&mut reader, &topic, target_compressed, target_qos))
+            .transpose()?;
+        let mut camera = image_topic
+            .map(|topic| subscribe(&mut reader, &topic, image_compressed, camera_qos))
+            .transpose()?;
+        ready.send(())?;
+        while stop.load(Ordering::Relaxed) && receiver_context.is_valid() {
+            reader.spin_once(Duration::from_millis(2));
+            let replacement = latest(&mut target);
+            let frame = latest(&mut camera);
+            let mut slot = inbox.lock().unwrap();
+            if let Some(image) = replacement {
+                slot.epoch += 1;
+                slot.target = Some(image);
+                slot.frame = None;
+            }
+            if let Some(image) = frame {
+                slot.frame = Some((image, Instant::now()));
+            }
+        }
+        Ok(())
+    });
+    if startup.recv().is_err() {
+        return receiver.join().expect("input thread panicked");
+    }
     let publisher=node.create_publisher_untyped(&args.bbox_topic,"mobile_tracker_interfaces/msg/TrackingResult",r2r::QosProfile{depth:1,..r2r::QosProfile::default()})
         .context("custom message unavailable: build ros2/mobile_tracker_interfaces, source its install/setup.bash, then rebuild r2r with IDL_PACKAGE_FILTER including mobile_tracker_interfaces")?;
     let mut video = args
@@ -177,7 +212,11 @@ pub fn run(
     let mut sequence = 0;
     while running.load(Ordering::Relaxed) && context.is_valid() {
         node.spin_once(Duration::from_millis(2));
-        if let Some(image) = latest(&mut target) {
+        let (epoch, replacement, frame) = {
+            let mut slot = mailbox.lock().unwrap();
+            (slot.epoch, slot.target.take(), slot.frame.take())
+        };
+        if let Some(image) = replacement {
             match image
                 .decode()
                 .and_then(|m| engine.set_target(&m, args.roi()))
@@ -192,8 +231,8 @@ pub fn run(
             }
         }
         let mut incoming = None;
-        if let Some(image) = latest(&mut camera) {
-            last_received = Instant::now();
+        if let Some((image, received)) = frame {
+            last_received = received;
             let header = image.header();
             match image.decode() {
                 Ok(frame) => incoming = Some((frame, header, None)),
@@ -239,9 +278,12 @@ pub fn run(
                     last.clone()
                 }
             };
-            emit(&last, &publisher, file)?;
+            // A prompt may arrive while the old target is in inference.
+            if mailbox.lock().unwrap().epoch == epoch {
+                emit(&last, &publisher, file)?;
+            }
             sequence += 1;
-        } else if camera.is_some()
+        } else if args.image_topic.is_some()
             && last_received.elapsed() > Duration::from_millis(args.source_timeout_ms)
             && last_timeout.elapsed() > Duration::from_millis(args.source_timeout_ms)
         {

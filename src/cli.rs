@@ -13,11 +13,13 @@ pub enum Durability {
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Rust NanoTrack + YOLOE visual-prompt global search, with optional ROS 2 transport"
+    about = "Rust NanoTrack + instance feature matching or YOLOE, with optional ROS 2 transport"
 )]
 #[command(group(ArgGroup::new("source").required(true).args(["video","image_topic"])))]
 #[command(group(ArgGroup::new("reference").required(true).multiple(true).args(["target","target_topic"])))]
 pub struct Args {
+    #[arg(long, value_enum, default_value = "features")]
+    pub search_backend: crate::tracker::Backend,
     #[arg(long, help = "Video file, RTSP/HTTP URL, or camera:N")]
     pub video: Option<String>,
     #[arg(long, help = "ROS sensor_msgs/msg/Image source")]
@@ -141,6 +143,7 @@ impl Args {
             "timeouts must be positive"
         );
         Ok(Config {
+            backend: self.search_backend,
             max_width: self.max_width,
             yoloe_encoder: self.yoloe_encoder.clone(),
             yoloe_detector: self.yoloe_detector.clone(),

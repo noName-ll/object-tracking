@@ -12,3 +12,6 @@ pub mod tracker;
 pub mod video;
 #[cfg(feature = "vision")]
 pub mod yoloe;
+
+#[cfg(feature = "vision")]
+mod features;

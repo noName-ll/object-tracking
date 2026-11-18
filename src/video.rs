@@ -1,9 +1,9 @@
 use crate::contract::{Header, Stamp};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use opencv::{core::Mat, prelude::*, videoio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub struct Video {
+struct Capture {
     capture: videoio::VideoCapture,
     live: bool,
     fps: f64,
@@ -11,7 +11,7 @@ pub struct Video {
     frame_id: String,
 }
 
-impl Video {
+impl Capture {
     pub fn open(source: &str, frame_id: &str) -> Result<Self> {
         let camera = source
             .strip_prefix("camera:")
@@ -63,5 +63,68 @@ impl Video {
             header,
             (!self.live && position.is_finite()).then_some(position),
         )))
+    }
+}
+
+type Frame = (Mat, Header, Option<f64>);
+type ReadResult = Result<Option<Frame>>;
+#[derive(Default)]
+struct LiveInput {
+    frame: Option<Frame>,
+    end: Option<ReadResult>,
+}
+enum Input {
+    File(Capture),
+    Live(std::sync::Arc<std::sync::Mutex<LiveInput>>),
+}
+pub struct Video(Input);
+impl Video {
+    pub fn open(source: &str, frame_id: &str) -> Result<Self> {
+        let mut capture = Capture::open(source, frame_id)?;
+        if !capture.live {
+            return Ok(Self(Input::File(capture)));
+        }
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(LiveInput::default()));
+        let weak = std::sync::Arc::downgrade(&slot);
+        std::thread::Builder::new()
+            .name("camera-reader".into())
+            .spawn(move || loop {
+                let result = capture.read();
+                let Some(shared) = weak.upgrade() else {
+                    break;
+                };
+                let mut inbox = shared.lock().unwrap();
+                match result {
+                    Ok(Some(frame)) => inbox.frame = Some(frame),
+                    terminal => {
+                        inbox.end = Some(terminal);
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self(Input::Live(slot)))
+    }
+    pub fn ready(&self) -> bool {
+        match &self.0 {
+            Input::File(c) => c.ready(),
+            Input::Live(slot) => {
+                let s = slot.lock().unwrap();
+                s.frame.is_some() || s.end.is_some()
+            }
+        }
+    }
+    pub fn read(&mut self) -> ReadResult {
+        match &mut self.0 {
+            Input::File(c) => c.read(),
+            Input::Live(slot) => {
+                let mut s = slot.lock().unwrap();
+                if let Some(frame) = s.frame.take() {
+                    return Ok(Some(frame));
+                }
+                s.end
+                    .take()
+                    .context("call ready before reading a live source")?
+            }
+        }
     }
 }

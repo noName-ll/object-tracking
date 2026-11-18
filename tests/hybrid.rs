@@ -103,6 +103,7 @@ fn natural() -> anyhow::Result<(Mat, Mat)> {
 fn retained_reference_model_loss_reacquisition_and_target_swap() -> anyhow::Result<()> {
     let (photo, object) = natural()?;
     let config = Config {
+        backend: mobile_object_tracker::tracker::Backend::Yoloe,
         gap_timeout: Duration::from_secs(30),
         verification_ttl: Duration::from_secs(30),
         ..Default::default()
@@ -179,6 +180,8 @@ fn video_file_cli_emits_original_resolution_boxes_and_jsonl() -> anyhow::Result<
     writer.release()?;
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_mobile-object-tracker"))
         .args([
+            "--search-backend",
+            "yoloe",
             "--video",
             video.to_str().unwrap(),
             "--target",
@@ -245,5 +248,97 @@ fn changing_visual_prompt_changes_detected_object_without_reexport() -> anyhow::
         first.bbox.iou(second.bbox) < 0.5,
         "different prompts must not use a constant exported class"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NanoTrack weights"]
+fn feature_search_tracks_specific_pattern() -> anyhow::Result<()> {
+    let reference = reference()?;
+    let config = Config {
+        gap_timeout: Duration::from_secs(30),
+        verification_ttl: Duration::from_secs(30),
+        ..Default::default()
+    };
+    let mut engine = Engine::new(
+        config,
+        "models/nanotrack_backbone_sim.onnx",
+        "models/nanotrack_head_sim.onnx",
+    )?;
+    let image = scene(&reference, 90, 80, 123)?;
+    assert_eq!(
+        engine.process(&image, Header::default(), 0, None)?.status,
+        "waiting_target"
+    );
+    assert_eq!(engine.set_target(&reference, None)?, 1);
+    let first = engine.process(&image, Header::default(), 1, None)?;
+    assert_eq!(first.status, "tracking_verified");
+    assert_eq!(first.target_generation, 1);
+    assert!(
+        first.bbox.unwrap().iou(Bbox {
+            x: 90.0,
+            y: 80.0,
+            width: 220.0,
+            height: 180.0
+        }) > 0.9
+    );
+    // New background; the reference is not resent.
+    let second = engine.process(&scene(&reference, 95, 82, 456)?, Header::default(), 2, None)?;
+    eprintln!(
+        "hybrid second frame: {} score={}",
+        second.status, second.model_score
+    );
+    assert!(second.bbox.is_some());
+    assert_eq!(second.target_generation, 1);
+    let blank = Mat::new_rows_cols_with_default(540, 800, core::CV_8UC3, Scalar::all(0.0))?;
+    let loss = engine.process(&blank, Header::default(), 3, None)?;
+    assert_eq!(loss.status, "blurred");
+    assert!(loss.bbox.is_none());
+    let reacquired = engine.process(
+        &scene(&reference, 500, 300, 789)?,
+        Header::default(),
+        4,
+        None,
+    )?;
+    assert_eq!(reacquired.status, "tracking_verified");
+    assert_eq!(reacquired.target_generation, 1);
+    assert!(engine.set_target(&blank, None).is_err());
+    let retained = engine.process(
+        &scene(&reference, 500, 300, 999)?,
+        Header::default(),
+        5,
+        None,
+    )?;
+    assert_eq!(retained.target_generation, 1);
+    assert_eq!(engine.set_target(&reference, None)?, 2);
+    assert_eq!(
+        engine
+            .process(&image, Header::default(), 6, None)?
+            .target_generation,
+        2
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires test_bus.jpg and NanoTrack weights"]
+fn feature_prompt_finds_the_selected_person() -> anyhow::Result<()> {
+    let (image, _) = natural()?;
+    let roi = Rect::new(24, 199, 99, 252);
+    let mut engine = Engine::new(
+        Config::default(),
+        "models/nanotrack_backbone_sim.onnx",
+        "models/nanotrack_head_sim.onnx",
+    )?;
+    engine.set_target(&image, Some(roi))?;
+    let found = engine.process(&image, Header::default(), 0, None)?;
+    let expected = Bbox {
+        x: 24.,
+        y: 199.,
+        width: 99.,
+        height: 252.,
+    };
+    assert!(found.bbox.expect("selected person's box").iou(expected) > 0.9);
+    assert!(found.inliers >= 12);
     Ok(())
 }

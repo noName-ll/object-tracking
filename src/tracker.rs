@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub backend: Backend,
     pub max_width: i32,
     pub yoloe_encoder: String,
     pub yoloe_detector: String,
@@ -30,6 +31,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            backend: Backend::Features,
             max_width: 960,
             yoloe_encoder: "models/yoloe/encoder.onnx".into(),
             yoloe_detector: "models/yoloe/detector.onnx".into(),
@@ -46,10 +48,19 @@ impl Default for Config {
     }
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum Backend {
+    Features,
+    Yoloe,
+}
+enum Prompt {
+    Features(crate::features::Reference),
+    Yoloe(Vec<f32>),
+}
 pub struct Engine {
     config: Config,
-    reference: TargetSlot<Vec<f32>>,
-    search: YoloE,
+    reference: TargetSlot<Prompt>,
+    search: Option<YoloE>,
     nano: NanoTrack,
     active: bool,
     frame: u64,
@@ -83,7 +94,7 @@ fn resize(image: &Mat, maximum: i32) -> Result<Mat> {
     Ok(output)
 }
 
-fn gray(image: &Mat) -> Result<Mat> {
+pub(crate) fn gray(image: &Mat) -> Result<Mat> {
     let mut output = Mat::default();
     imgproc::cvt_color(image, &mut output, imgproc::COLOR_BGR2GRAY, 0)?;
     Ok(output)
@@ -108,14 +119,17 @@ pub fn blur_variance(image: &Mat) -> Result<f64> {
 
 impl Engine {
     pub fn new(config: Config, backbone: &str, head: &str) -> Result<Self> {
-        let search = YoloE::load(
-            &config.yoloe_encoder,
-            &config.yoloe_detector,
-            config.yoloe_size,
-            config.search_score,
-            config.search_iou,
-            config.search_margin,
-        )?;
+        let search = match config.backend {
+            Backend::Features => None,
+            Backend::Yoloe => Some(YoloE::load(
+                &config.yoloe_encoder,
+                &config.yoloe_detector,
+                config.yoloe_size,
+                config.search_score,
+                config.search_iou,
+                config.search_margin,
+            )?),
+        };
         Ok(Self {
             config,
             search,
@@ -157,7 +171,13 @@ impl Engine {
             "reference too small"
         );
         // Compute the candidate prompt before changing the retained target or NanoTrack state.
-        let candidate = self.search.encode(&selected)?;
+        let candidate = match self.search.as_mut() {
+            Some(yolo) => Prompt::Yoloe(yolo.encode(&selected)?),
+            None => Prompt::Features(crate::features::Reference::encode(&resize(
+                &selected,
+                self.config.max_width.min(640),
+            )?)?),
+        };
         let generation = self
             .reference
             .replace(Ok::<_, String>(candidate))
@@ -244,8 +264,21 @@ impl Engine {
                     .verified_at
                     .is_none_or(|t| t.elapsed() > self.config.verification_ttl);
             let global = if verify {
-                self.search
-                    .search(&work, self.reference.value.as_ref().unwrap())?
+                match self.reference.value.as_ref().unwrap() {
+                    Prompt::Yoloe(prompt) => self
+                        .search
+                        .as_mut()
+                        .expect("configured YOLOE")
+                        .search(&work, prompt)?,
+                    Prompt::Features(prompt) => match prompt.locate(&work)? {
+                        Some((bbox, count, ratio)) => {
+                            result.inliers = count as u32;
+                            result.inlier_ratio = ratio;
+                            SearchResult::Found(crate::yoloe::Candidate { bbox, score: 0.0 })
+                        }
+                        None => SearchResult::Missing,
+                    },
+                }
             } else {
                 SearchResult::Missing
             };
